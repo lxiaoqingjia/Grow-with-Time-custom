@@ -1,0 +1,98 @@
+# Build ad-hoc signed macOS Apple Silicon (M1/M2/M3/M4) installer.
+# After push, download the "macos-aarch64" artifact from the Actions run.
+name: Build macOS (Apple Silicon)
+
+on:
+  workflow_dispatch:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build-macos-arm:
+    runs-on: macos-14
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "22"
+          cache: npm
+
+      - name: Setup Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri
+
+      - name: Install frontend deps
+        run: npm ci
+
+      - name: Release check, tests, and frontend build
+        run: npm run release:check
+
+      - name: Build Tauri (aarch64)
+        env:
+          APPLE_SIGNING_IDENTITY: "-"
+        run: npm run tauri build -- --target aarch64-apple-darwin --bundles app,dmg
+
+      - name: Re-sign app and rebuild verified DMG
+        shell: bash
+        run: |
+          APP_PATH="$(find src-tauri/target/aarch64-apple-darwin/release/bundle/macos -maxdepth 1 -name '*.app' -print -quit)"
+          DMG_PATH="$(find src-tauri/target/aarch64-apple-darwin/release/bundle/dmg -maxdepth 1 -name '*.dmg' -print -quit)"
+          test -n "$APP_PATH"
+          test -n "$DMG_PATH"
+          codesign --force --deep --sign - "$APP_PATH"
+          codesign --display --deep --verbose=4 "$APP_PATH"
+          codesign --verify --deep --verbose=2 "$APP_PATH"
+          STAGING_DIR="$(mktemp -d)"
+          cp -R "$APP_PATH" "$STAGING_DIR/"
+          ln -s /Applications "$STAGING_DIR/Applications"
+          rm "$DMG_PATH"
+          hdiutil create \
+            -volname "Grow with Time" \
+            -srcfolder "$STAGING_DIR" \
+            -ov \
+            -format UDZO \
+            "$DMG_PATH"
+          hdiutil verify "$DMG_PATH"
+
+      - name: Upload DMG / App
+        uses: actions/upload-artifact@v4
+        with:
+          name: grow-with-time-macos-aarch64
+          path: |
+            src-tauri/target/aarch64-apple-darwin/release/bundle/dmg/*.dmg
+            src-tauri/target/aarch64-apple-darwin/release/bundle/macos/*.app
+          if-no-files-found: error
+
+      - name: Upload to GitHub Release
+        if: startsWith(github.ref, 'refs/tags/')
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          files: |
+            src-tauri/target/aarch64-apple-darwin/release/bundle/dmg/*.dmg
+
+      - name: Sync installer to Gitee Release
+        if: startsWith(github.ref, 'refs/tags/')
+        env:
+          GITEE_TOKEN: ${{ secrets.GITEE_TOKEN }}
+        shell: bash
+        run: |
+          if [ -z "$GITEE_TOKEN" ]; then
+            echo "跳过 Gitee 同步：未配置 secrets.GITEE_TOKEN"
+            exit 0
+          fi
+          DMG="$(find src-tauri/target/aarch64-apple-darwin/release/bundle/dmg -maxdepth 1 -name '*.dmg' -print -quit)"
+          node scripts/sync-gitee-release.mjs --tag "${GITHUB_REF_NAME}" --file "$DMG"
