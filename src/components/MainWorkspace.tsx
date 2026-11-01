@@ -1,0 +1,1697 @@
+import { lazy, Suspense, useEffect, useMemo, useRef, useState, type CSSProperties } from "react";
+import {
+  DndContext,
+  type DragEndEvent,
+  PointerSensor,
+  useSensor,
+  useSensors,
+} from "@dnd-kit/core";
+import {
+  SortableContext,
+  verticalListSortingStrategy,
+} from "@dnd-kit/sortable";
+import { useAppStore } from "@/store/app";
+import {
+  boardColumns,
+  filterTasksByStatus,
+  filterTasksByView,
+  getEmptyMessage,
+  getViewTitle,
+  isActiveTask,
+  isInboxTask,
+} from "@/lib/tasks";
+import { formatDueDate, formatTimeRange, priorityLabel, todayDateString, addDays, formatLongDate, weekDates, parseDate, startOfWeek, parseTimeToMinutes } from "@/lib/dates";
+import type { Task, TaskStatusFilter } from "@/types";
+import { ExpandableTaskItem } from "@/components/ExpandableTaskItem";
+import { PageCloseButton } from "@/components/PageCloseButton";
+import { TagFilterBar } from "@/components/TagFilterBar";
+import { TaskExportMenu } from "@/components/TaskExportMenu";
+import {
+  buildTaskDeferredUpdate,
+  findTimeConflictIds,
+  suggestDaySchedule,
+} from "@/lib/planning";
+import { saveDayCloseReflection, saveDaySnapshot } from "@/lib/db";
+
+const SettingsView = lazy(() =>
+  import("@/components/SettingsView").then((module) => ({
+    default: module.SettingsView,
+  })),
+);
+const HabitsView = lazy(() =>
+  import("@/components/HabitsView").then((module) => ({
+    default: module.HabitsView,
+  })),
+);
+const RemindersView = lazy(() =>
+  import("@/components/RemindersView").then((module) => ({
+    default: module.RemindersView,
+  })),
+);
+const ReviewView = lazy(() =>
+  import("@/components/ReviewView").then((module) => ({
+    default: module.ReviewView,
+  })),
+);
+const WeeklyChecklistView = lazy(() =>
+  import("@/components/WeeklyChecklistView").then((module) => ({
+    default: module.WeeklyChecklistView,
+  })),
+);
+const ProjectsView = lazy(() =>
+  import("@/components/ProjectsView").then((module) => ({
+    default: module.ProjectsView,
+  })),
+);
+const MemosView = lazy(() =>
+  import("@/components/MemosView").then((module) => ({
+    default: module.MemosView,
+  })),
+);
+const GrowthView = lazy(() =>
+  import("@/components/GrowthView").then((module) => ({
+    default: module.GrowthView,
+  })),
+);
+const MomentsView = lazy(() =>
+  import("@/components/MomentsView").then((module) => ({ default: module.MomentsView })),
+);
+const AnniversariesView = lazy(() =>
+  import("@/components/AnniversariesView").then((module) => ({
+    default: module.AnniversariesView,
+  })),
+);
+const ToolboxView = lazy(() =>
+  import("@/components/ToolboxView").then((module) => ({
+    default: module.ToolboxView,
+  })),
+);
+const LedgerView = lazy(() =>
+  import("@/components/LedgerView").then((module) => ({ default: module.LedgerView })),
+);
+
+function BoardView({ tasks }: { tasks: Task[] }) {
+  const cols = boardColumns(tasks);
+  const saveTask = useAppStore((s) => s.saveTask);
+  const sensors = useSensors(useSensor(PointerSensor, { activationConstraint: { distance: 6 } }));
+
+  const onDragEnd = (event: DragEndEvent) => {
+    const { active, over } = event;
+    if (!over) return;
+    const id = String(active.id);
+    const col = String(over.id);
+    if (col === "pending") void saveTask(id, { status: "pending" });
+    if (col === "completed") void saveTask(id, { status: "completed" });
+    if (col === "overdue") {
+      const yesterday = new Date();
+      yesterday.setDate(yesterday.getDate() - 1);
+      const d = `${yesterday.getFullYear()}-${String(yesterday.getMonth() + 1).padStart(2, "0")}-${String(yesterday.getDate()).padStart(2, "0")}`;
+      void saveTask(id, { status: "pending", due_date: d });
+    }
+  };
+
+  return (
+    <DndContext sensors={sensors} onDragEnd={onDragEnd}>
+      <div className="board">
+        {(
+          [
+            ["pending", "进行中", cols.pending],
+            ["overdue", "已过期", cols.overdue],
+            ["completed", "已完成", cols.completed],
+          ] as const
+        ).map(([id, title, list]) => (
+          <div key={id} className="board-col" id={id}>
+            <h3>
+              {title} · {list.length}
+            </h3>
+            <SortableContext items={list.map((t) => t.id)} strategy={verticalListSortingStrategy}>
+              {list.map((task) => (
+                <ExpandableTaskItem
+                  key={task.id}
+                  task={task}
+                  meta={<span>{formatDueDate(task.due_date)}</span>}
+                />
+              ))}
+            </SortableContext>
+          </div>
+        ))}
+      </div>
+    </DndContext>
+  );
+}
+
+function DayBoard() {
+  const allTasks = useAppStore((s) => s.tasks);
+  const nav = useAppStore((s) => s.nav);
+  const setNav = useAppStore((s) => s.setNav);
+  const saveTask = useAppStore((s) => s.saveTask);
+  const cursor = useAppStore((s) => s.calendarCursor);
+  const setCalendarCursor = useAppStore((s) => s.setCalendarCursor);
+  const today = todayDateString();
+  const isTodayView = nav === "today";
+  const isInboxView = nav === "inbox";
+  const batchComplete = useAppStore((s) => s.batchComplete);
+  const batchDelete = useAppStore((s) => s.batchDelete);
+  const selectTask = useAppStore((s) => s.selectTask);
+  const setFocusTask = useAppStore((s) => s.setFocusTask);
+  const toggleFocus = useAppStore((s) => s.toggleFocus);
+  const focusRunning = useAppStore((s) => s.focusRunning);
+  const focusTaskId = useAppStore((s) => s.focusTaskId);
+  const focusSeconds = useAppStore((s) => s.focusSeconds);
+  const [selecting, setSelecting] = useState(false);
+  const [selectedIds, setSelectedIds] = useState<string[]>([]);
+  const [schedulePreview, setSchedulePreview] = useState<
+    ReturnType<typeof suggestDaySchedule>
+  >([]);
+  const [acceptedScheduleIds, setAcceptedScheduleIds] = useState<string[]>([]);
+  const [closingDay, setClosingDay] = useState(false);
+  const [reflection, setReflection] = useState("");
+  const [dispositions, setDispositions] = useState<Record<string, string>>({});
+  const [batchDate, setBatchDate] = useState(addDays(cursor, 1));
+  const [applyingSchedule, setApplyingSchedule] = useState(false);
+  const [settlingDay, setSettlingDay] = useState(false);
+
+  useEffect(() => {
+    setBatchDate(addDays(isInboxView ? today : cursor, 1));
+  }, [cursor, isInboxView, today]);
+
+  useEffect(() => {
+    if (isTodayView && cursor !== today) setCalendarCursor(today);
+  }, [cursor, isTodayView, setCalendarCursor, today]);
+
+  const dayTasks = useMemo(() => {
+    return allTasks
+      .filter((t) => {
+        if (t.parent_id || t.deleted_at) return false;
+        if (isInboxView) {
+          return isInboxTask(t, today);
+        }
+        if (isTodayView) {
+          if (t.my_day_date === cursor || t.due_date === cursor) return true;
+          return cursor === today && isActiveTask(t) && Boolean(t.due_date) && t.due_date! < today;
+        }
+        if (t.due_date === cursor) return true;
+        // Viewing today: also show unfinished overdue tasks (rollover fallback).
+        return (
+          cursor === today &&
+          isActiveTask(t) &&
+          t.due_date !== null &&
+          t.due_date < today
+        );
+      })
+      .sort((a, b) => {
+        if (isInboxView) {
+          return (
+            (a.due_date ?? "9999-12-31").localeCompare(b.due_date ?? "9999-12-31") ||
+            a.priority - b.priority ||
+            (a.due_time ?? "99:99").localeCompare(b.due_time ?? "99:99") ||
+            a.sort_order - b.sort_order
+          );
+        }
+        return (a.due_time ?? "").localeCompare(b.due_time ?? "");
+      });
+  }, [allTasks, cursor, today, isInboxView, isTodayView]);
+  const myDayCandidates = allTasks
+    .filter(
+      (task) =>
+        !task.parent_id &&
+        !task.deleted_at &&
+        isActiveTask(task) &&
+        task.my_day_date !== cursor &&
+        task.due_date !== cursor &&
+        !(cursor === today && task.due_date && task.due_date < today),
+    )
+    .slice(0, 6);
+  const pending = dayTasks.filter(isActiveTask).length;
+  const done = dayTasks.filter((t) => t.status === "completed").length;
+  const total = pending + done;
+  const completion = total ? Math.round((done / total) * 100) : 0;
+  const dueOnCursor = dayTasks.filter((task) => task.due_date === cursor);
+  const overdueTasks = isTodayView && cursor === today
+    ? dayTasks.filter(
+        (task) =>
+          isActiveTask(task) && Boolean(task.due_date) && task.due_date! < today,
+      )
+    : [];
+  const plannedOnlyTasks = dayTasks.filter((task) => task.my_day_date === cursor && task.due_date !== cursor && !(cursor === today && task.due_date && task.due_date < today));
+  const dueActive = dueOnCursor.filter(isActiveTask).length;
+  const plannedActive = dayTasks.filter((task) => isActiveTask(task) && task.my_day_date === cursor).length;
+  const inboxGroups = useMemo(() => {
+    if (!isInboxView) return [];
+    const overdue = dayTasks.filter((task) => Boolean(task.due_date) && task.due_date! < today);
+    const todayTasks = dayTasks.filter(
+      (task) =>
+        !overdue.includes(task) &&
+        (task.due_date === today || task.my_day_date === today),
+    );
+    const upcoming = dayTasks.filter(
+      (task) =>
+        !overdue.includes(task) &&
+        !todayTasks.includes(task) &&
+        Boolean(task.due_date) &&
+        task.due_date! > today,
+    );
+    const unscheduled = dayTasks.filter(
+      (task) =>
+        !overdue.includes(task) &&
+        !todayTasks.includes(task) &&
+        !upcoming.includes(task),
+    );
+    return [
+      { id: "overdue", title: "已经逾期", hint: "先处理失约事项", tasks: overdue },
+      { id: "today", title: "今天相关", hint: "今天截止或已加入今日计划", tasks: todayTasks },
+      { id: "upcoming", title: "后续待办", hint: "已有日期，按时间先后排列", tasks: upcoming },
+      { id: "unscheduled", title: "未排期", hint: "还没有日期，等待安排", tasks: unscheduled },
+    ];
+  }, [dayTasks, isInboxView, today]);
+  const inboxOverdueCount = inboxGroups.find((group) => group.id === "overdue")?.tasks.length ?? 0;
+  const inboxTodayCount = inboxGroups.find((group) => group.id === "today")?.tasks.length ?? 0;
+  const inboxUpcomingCount = inboxGroups.find((group) => group.id === "upcoming")?.tasks.length ?? 0;
+  const inboxUnscheduledCount = inboxGroups.find((group) => group.id === "unscheduled")?.tasks.length ?? 0;
+  const conflictIds = findTimeConflictIds(dayTasks);
+  const nextTask = useMemo(() => {
+    const active = dayTasks.filter(isActiveTask);
+    const now = new Date();
+    const nowMinutes = now.getHours() * 60 + now.getMinutes();
+    const priorityRank = (priority: number) => priority;
+    const timingRank = (task: Task) => {
+      const minutes = parseTimeToMinutes(task.due_time);
+      if (minutes === null) return [2, Number.MAX_SAFE_INTEGER] as const;
+      if (cursor !== today) return [0, minutes] as const;
+      if (minutes <= nowMinutes) return [0, nowMinutes - minutes] as const;
+      return [1, minutes - nowMinutes] as const;
+    };
+
+    return [...active].sort((left, right) => {
+      const leftTiming = timingRank(left);
+      const rightTiming = timingRank(right);
+      return (
+        leftTiming[0] - rightTiming[0] ||
+        priorityRank(left.priority) - priorityRank(right.priority) ||
+        leftTiming[1] - rightTiming[1] ||
+        left.sort_order - right.sort_order
+      );
+    })[0];
+  }, [cursor, dayTasks, today]);
+  const focusClock = `${String(Math.floor(focusSeconds / 60)).padStart(2, "0")}:${String(focusSeconds % 60).padStart(2, "0")}`;
+  const focusTask = allTasks.find((task) => task.id === focusTaskId) ?? null;
+
+  const startNextTask = () => {
+    // Already focusing: open that task so the timer/controls are visible.
+    if (focusRunning && focusTaskId) {
+      selectTask(focusTaskId);
+      useAppStore.getState().setToast(
+        `专注进行中「${focusTask?.title ?? "当前任务"}」· ${focusClock} · 可在详情暂停`,
+      );
+      return;
+    }
+    if (!nextTask) {
+      useAppStore.getState().setToast("今天还没有待执行任务，可以新建或从待办箱安排");
+      return;
+    }
+    selectTask(nextTask.id);
+    setFocusTask(nextTask.id);
+    if (nextTask.status !== "in_progress") {
+      void saveTask(nextTask.id, { status: "in_progress" });
+    }
+    void toggleFocus().then(() => {
+      useAppStore
+        .getState()
+        .setToast(`已开始专注「${nextTask.title}」· 右侧可暂停或重置`);
+    });
+  };
+  const previewSchedule = () => {
+    const suggestions = suggestDaySchedule(
+      dayTasks.map((task) =>
+        task.schedule_locked ? { ...task, flexible: 0 } : task,
+      ),
+    );
+    setSchedulePreview(suggestions);
+    setAcceptedScheduleIds(suggestions.map((item) => item.taskId));
+    if (!suggestions.length) {
+      useAppStore.getState().setToast("没有可排程的灵活任务");
+    }
+  };
+
+  const applySchedule = async () => {
+    if (!acceptedScheduleIds.length || applyingSchedule) return;
+    if (
+      !window.confirm(
+        `将调整 ${acceptedScheduleIds.length} 项任务的日期和时间。确认应用这份排程吗？`,
+      )
+    ) {
+      return;
+    }
+    setApplyingSchedule(true);
+    try {
+      for (const item of schedulePreview) {
+        if (!acceptedScheduleIds.includes(item.taskId)) continue;
+        await saveTask(item.taskId, {
+          due_date: cursor,
+          due_time: item.start,
+          end_time: item.end,
+          flexible: 0,
+          schedule_locked: 1,
+        });
+      }
+      setSchedulePreview([]);
+      useAppStore.getState().setToast("今日计划已应用");
+    } finally {
+      setApplyingSchedule(false);
+    }
+  };
+
+  const openDayClose = () => {
+    setDispositions(
+      Object.fromEntries(
+        dayTasks.filter(isActiveTask).map((task) => [task.id, "tomorrow"]),
+      ),
+    );
+    setClosingDay(true);
+  };
+
+  const settleDay = async () => {
+    if (settlingDay) return;
+    const activeTasks = dayTasks.filter(isActiveTask);
+    const tomorrowCount = activeTasks.filter(
+      (task) => (dispositions[task.id] ?? "tomorrow") === "tomorrow",
+    ).length;
+    const removedCount = activeTasks.filter(
+      (task) => dispositions[task.id] === "remove",
+    ).length;
+    const cancelCount = activeTasks.filter(
+      (task) => dispositions[task.id] === "cancel",
+    ).length;
+    if (
+      !window.confirm(
+        `确认今日收尾？\n顺延明天 ${tomorrowCount} 项 · 移出今日计划 ${removedCount} 项 · 取消 ${cancelCount} 项`,
+      )
+    ) {
+      return;
+    }
+    setSettlingDay(true);
+    try {
+      await saveDaySnapshot(cursor, dayTasks, "evening");
+      await saveDayCloseReflection(
+        cursor,
+        reflection,
+        `完成 ${done} 项任务，还有 ${pending} 项完成了今日安排。`,
+      );
+      for (const task of activeTasks) {
+        const choice = dispositions[task.id] ?? "tomorrow";
+        if (choice === "cancel") {
+          await saveTask(task.id, { status: "cancelled", my_day_date: null });
+        } else if (choice === "remove") {
+          await saveTask(task.id, { my_day_date: null });
+        } else {
+          await saveTask(task.id, buildTaskDeferredUpdate(task, cursor, addDays(cursor, 1), today));
+        }
+      }
+      setClosingDay(false);
+      setReflection("");
+      useAppStore.getState().setToast("今日收尾已完成，今天的行动已带入拾光");
+      setNav("daily-reflection");
+    } finally {
+      setSettlingDay(false);
+    }
+  };
+
+  const updateSelected = async (
+    updates: Parameters<typeof saveTask>[1],
+    message: string,
+  ) => {
+    await Promise.all(selectedIds.map((id) => saveTask(id, updates)));
+    setSelectedIds([]);
+    useAppStore.getState().setToast(message);
+  };
+
+  const deferSelected = async (date: string, message: string) => {
+    const tasksById = new Map(allTasks.map((task) => [task.id, task]));
+    await Promise.all(
+      selectedIds.map((id) => {
+        const task = tasksById.get(id);
+        if (!task) return Promise.resolve();
+        return saveTask(
+          id,
+          buildTaskDeferredUpdate(task, isInboxView ? today : cursor, date, today),
+        );
+      }),
+    );
+    setSelectedIds([]);
+    useAppStore.getState().setToast(message);
+  };
+
+  const renderDayTask = (task: Task) => (
+    <ExpandableTaskItem
+      key={task.id}
+      task={task}
+      selection={{
+        active: selecting,
+        selected: selectedIds.includes(task.id),
+        onToggle: () =>
+          setSelectedIds((ids) =>
+            ids.includes(task.id)
+              ? ids.filter((id) => id !== task.id)
+              : [...ids, task.id],
+          ),
+      }}
+      meta={
+        <>
+          {isInboxView ? <span>{formatDueDate(task.due_date)}</span> : null}
+          {task.due_time || !isInboxView ? <span>{formatTimeRange(task.due_time, task.end_time)}</span> : null}
+          <span>{priorityLabel(task.priority)}</span>
+          {isTodayView && task.my_day_date === cursor ? <span className="day-source-chip is-planned">今日计划</span> : null}
+          {isTodayView && task.due_date === cursor ? <span className="day-source-chip is-due">今天截止</span> : null}
+          {isTodayView && cursor === today && task.due_date && task.due_date < today ? <span className="day-source-chip is-overdue">已逾期</span> : null}
+          {conflictIds.has(task.id) ? (
+            <span className="conflict-chip">时间冲突</span>
+          ) : null}
+        </>
+      }
+      actions={
+        !selecting && isActiveTask(task) ? (
+          <>
+            <button
+              type="button"
+              className="btn-ghost"
+              onClick={() => {
+                if (focusRunning && focusTaskId !== task.id) {
+                  useAppStore
+                    .getState()
+                    .setToast("已有专注任务正在进行，请先暂停后再切换");
+                  return;
+                }
+                setFocusTask(task.id);
+                if (task.status !== "in_progress") {
+                  void saveTask(task.id, { status: "in_progress" });
+                }
+                if (!focusRunning) void toggleFocus();
+              }}
+            >
+              专注
+            </button>
+            {task.my_day_date !== (isInboxView ? today : cursor) ? (
+              <button
+                type="button"
+                className="btn-ghost"
+                onClick={() =>
+                  void saveTask(task.id, { my_day_date: isInboxView ? today : cursor }).then(() =>
+                    useAppStore.getState().setToast("已加入今日计划"),
+                  )
+                }
+              >
+                加入今日计划
+              </button>
+            ) : null}
+            <button
+              type="button"
+              className="btn-ghost"
+              onClick={() =>
+                void saveTask(
+                  task.id,
+                  buildTaskDeferredUpdate(
+                    task,
+                    isInboxView ? today : cursor,
+                    addDays(isInboxView ? today : cursor, 1),
+                    today,
+                  ),
+                )
+              }
+            >
+              明天
+            </button>
+            {task.my_day_date === (isInboxView ? today : cursor) ? (
+              <button
+                type="button"
+                className="btn-ghost"
+                onClick={() => void saveTask(task.id, { my_day_date: null })}
+              >
+                移出计划
+              </button>
+            ) : isTodayView ? (
+              <button
+                type="button"
+                className="btn-ghost"
+                onClick={() => void saveTask(task.id, { my_day_date: cursor })}
+              >
+                安排今天
+              </button>
+            ) : null}
+          </>
+        ) : null
+      }
+    />
+  );
+
+  return (
+    <div className={`scope-board ${isTodayView ? "is-deadline" : isInboxView ? "is-inbox" : ""}`}>
+      <section className={`today-hero ${isTodayView ? "is-deadline" : isInboxView ? "is-inbox" : "is-plan"}`}>
+        <div className="today-hero-copy">
+          <span className="today-eyebrow">{isInboxView ? "INBOX · 全周期待办" : cursor === today ? "TODAY · 今日行动" : "DAY · 当日安排"}</span>
+          <h3>
+            {isInboxView
+              ? pending ? `${pending} 项待办，按截止日期依次推进` : "所有任务都已经处理好了。"
+              : overdueTasks.length ? `${overdueTasks.length} 项需要优先处理` : done ? "做得很好，继续保持节奏。" : "从一件小事开始今天。"}
+          </h3>
+          <p className="today-hero-note">
+            {isInboxView
+              ? "这里汇总所有未完成任务，不受今日或是否设置截止日期限制。"
+              : "今日计划、今天截止与逾期事项集中在这里，每项任务只展示一次。"}
+          </p>
+          {isTodayView && conflictIds.size ? (
+            <span className="plan-warning">
+              {conflictIds.size} 项任务存在时间冲突
+            </span>
+          ) : null}
+          <div className="today-hero-actions">
+            {isInboxView ? (
+              <>
+                <button type="button" className="inbox-plan-action" onClick={() => setNav("today")}>
+                  查看今日行动
+                </button>
+                <button
+                  type="button"
+                  className="btn-ghost today-moment-action"
+                  onClick={() => {
+                    setSelecting((value) => !value);
+                    setSelectedIds([]);
+                  }}
+                >
+                  {selecting ? "退出整理" : "批量整理"}
+                </button>
+              </>
+            ) : <>
+              <div className="today-focus-block">
+                <button
+                  type="button"
+                  className={`today-focus-action ${focusRunning ? "is-running" : ""}`}
+                  onClick={startNextTask}
+                  disabled={!focusRunning && !nextTask}
+                >
+                  <span aria-hidden="true">{focusRunning ? "●" : "▶"}</span>
+                  <span className="today-focus-label">
+                    {focusRunning
+                      ? `专注中 ${focusClock}`
+                      : nextTask
+                        ? `开始：${nextTask.title}`
+                        : "今天已完成"}
+                  </span>
+                </button>
+                {focusRunning && focusTask ? (
+                  <p className="today-focus-status">
+                    「{focusTask.title}」· 点击打开计时
+                  </p>
+                ) : null}
+              </div>
+              {cursor === today ? (
+                <>
+                  {isTodayView ? (
+                    <button
+                      type="button"
+                      className="btn-ghost today-moment-action"
+                      onClick={() => void useAppStore.getState().openMorningPlan()}
+                    >
+                      今日计划
+                    </button>
+                  ) : null}
+                  <button
+                    type="button"
+                    className="btn-ghost today-moment-action"
+                    onClick={() => setNav("daily-reflection")}
+                  >
+                    今日拾光
+                  </button>
+                </>
+              ) : null}
+            </>}
+          </div>
+        </div>
+        {isTodayView ? (
+          <div className="deadline-stats is-combined">
+            <div className="deadline-stat is-planned"><span>今日计划</span><strong>{plannedActive}</strong></div>
+            {cursor === today ? (
+              <div className="deadline-stat is-overdue">
+                <span>已逾期</span>
+                <strong>{overdueTasks.length}</strong>
+              </div>
+            ) : null}
+            <div className="deadline-stat">
+              <span>{cursor === today ? "今天到期" : "当日到期"}</span>
+              <strong>{dueActive}</strong>
+            </div>
+          </div>
+        ) : isInboxView ? (
+          <div className="deadline-stats is-combined inbox-lifecycle-stats">
+            <div className="deadline-stat is-overdue"><span>已逾期</span><strong>{inboxOverdueCount}</strong></div>
+            <div className="deadline-stat is-today"><span>今天相关</span><strong>{inboxTodayCount}</strong></div>
+            <div className="deadline-stat"><span>后续待办</span><strong>{inboxUpcomingCount}</strong></div>
+            <div className="deadline-stat is-planned"><span>未排期</span><strong>{inboxUnscheduledCount}</strong></div>
+          </div>
+        ) : (
+          <div
+            className="today-progress-ring"
+            style={{ "--progress": completion } as CSSProperties}
+            aria-label={`完成进度 ${completion}%`}
+          >
+            <div>
+              <strong>{completion}%</strong>
+              <span>已完成</span>
+            </div>
+          </div>
+        )}
+      </section>
+      {!isInboxView ? <div className="scope-nav">
+        {!isTodayView ? <button
+          type="button"
+          className="btn-ghost"
+          onClick={() => setCalendarCursor(addDays(cursor, -1))}
+        >
+          ‹
+        </button> : null}
+        <strong>{isTodayView ? `今天 · ${formatLongDate(today)}` : formatLongDate(cursor)}</strong>
+        {!isTodayView ? <button
+          type="button"
+          className="btn-ghost"
+          onClick={() => setCalendarCursor(addDays(cursor, 1))}
+        >
+          ›
+        </button> : null}
+        {!isTodayView ? <button
+          type="button"
+          className="btn-ghost"
+          onClick={() => setCalendarCursor(today)}
+        >
+          今日
+        </button> : null}
+        <button
+          type="button"
+          className={`btn-ghost ${selecting ? "active" : ""}`}
+          onClick={() => {
+            setSelecting((value) => !value);
+            setSelectedIds([]);
+          }}
+        >
+          {selecting ? "退出批量" : "批量管理"}
+        </button>
+        {isTodayView ? (
+          <button
+            type="button"
+            className="btn-ghost schedule-action"
+            onClick={previewSchedule}
+          >
+            整理今日
+          </button>
+        ) : null}
+      </div> : null}
+
+      {schedulePreview.length ? (
+        <section className="schedule-preview">
+          <div className="schedule-preview-head">
+            <div>
+              <strong>今日排程建议</strong>
+              <span>先预览，再决定应用哪些调整</span>
+            </div>
+            <button type="button" className="btn-ghost" onClick={() => setSchedulePreview([])}>
+              关闭
+            </button>
+          </div>
+          {schedulePreview.map((item) => {
+            const task = dayTasks.find((candidate) => candidate.id === item.taskId);
+            const accepted = acceptedScheduleIds.includes(item.taskId);
+            return (
+              <div key={item.taskId} className="schedule-preview-row">
+                <input
+                  type="checkbox"
+                  checked={accepted}
+                  onChange={() =>
+                    setAcceptedScheduleIds((ids) =>
+                      accepted
+                        ? ids.filter((id) => id !== item.taskId)
+                        : [...ids, item.taskId],
+                    )
+                  }
+                />
+                <time>{item.start}–{item.end}</time>
+                <div>
+                  <strong>{task?.title}</strong>
+                  <span>
+                    {task?.due_date ? "优先满足截止日期" : "填入今日可用空隙"}
+                    {task?.energy_level ? ` · ${task.energy_level === "high" ? "高精力" : task.energy_level === "low" ? "低精力" : "中等精力"}` : ""}
+                  </span>
+                </div>
+                <button
+                  type="button"
+                  className="btn-ghost"
+                  onClick={() => {
+                    const locked = Boolean(task?.schedule_locked);
+                    if (!locked) {
+                      setAcceptedScheduleIds((ids) =>
+                        ids.filter((id) => id !== item.taskId),
+                      );
+                    }
+                    void saveTask(item.taskId, {
+                      schedule_locked: locked ? 0 : 1,
+                    });
+                  }}
+                >
+                  {task?.schedule_locked ? "已锁定" : "锁定"}
+                </button>
+              </div>
+            );
+          })}
+          <div className="schedule-preview-actions">
+            <span>{acceptedScheduleIds.length} 项将被调整</span>
+            <button
+              type="button"
+              className="btn-primary"
+              disabled={!acceptedScheduleIds.length || applyingSchedule}
+              onClick={() => void applySchedule()}
+            >
+              {applyingSchedule ? "应用中…" : "应用所选排程"}
+            </button>
+          </div>
+        </section>
+      ) : null}
+
+      {selecting ? (
+        <div className="batch-toolbar">
+          <span>已选择 {selectedIds.length} 项</span>
+          <button
+            type="button"
+            className="btn-ghost"
+            disabled={!selectedIds.length}
+            onClick={() =>
+              void deferSelected(
+                addDays(isInboxView ? today : cursor, 1),
+                `已将 ${selectedIds.length} 项顺延到明天`,
+              )
+            }
+          >
+            顺延明天
+          </button>
+          {isTodayView ? (
+            <button
+              type="button"
+              className="btn-ghost"
+              disabled={!selectedIds.length}
+              onClick={() =>
+                void updateSelected(
+                  { my_day_date: null },
+                  `已将 ${selectedIds.length} 项移出今日计划`,
+                )
+              }
+            >
+              移出今日
+            </button>
+          ) : null}
+          <label className="batch-date-action">
+            <span>改期</span>
+            <input
+              type="date"
+              className="field"
+              value={batchDate}
+              onChange={(event) => setBatchDate(event.target.value)}
+            />
+          </label>
+          <button
+            type="button"
+            className="btn-ghost"
+            disabled={!selectedIds.length || !batchDate}
+            onClick={() =>
+              void deferSelected(
+                batchDate,
+                `已调整 ${selectedIds.length} 项任务日期`,
+              )
+            }
+          >
+            应用日期
+          </button>
+          <button
+            type="button"
+            className="btn-ghost"
+            disabled={!selectedIds.length}
+            onClick={() => {
+              void batchComplete(selectedIds).then(() => setSelectedIds([]));
+            }}
+          >
+            批量完成
+          </button>
+          <button
+            type="button"
+            className="btn-ghost danger"
+            disabled={!selectedIds.length}
+            onClick={() => {
+              if (
+                !window.confirm(
+                  `确定将选中的 ${selectedIds.length} 项任务移入回收站吗？`,
+                )
+              ) {
+                return;
+              }
+              void batchDelete(selectedIds).then(() => setSelectedIds([]));
+            }}
+          >
+            批量删除
+          </button>
+        </div>
+      ) : null}
+
+      {isTodayView && myDayCandidates.length ? (
+        <section className="myday-picker">
+          <div>
+            <strong>为今天挑选任务</strong>
+            <span>从待办中加入，不会改变原截止日期</span>
+          </div>
+          <div className="myday-candidates">
+            {myDayCandidates.map((task) => (
+              <button
+                key={task.id}
+                type="button"
+                onClick={() =>
+                  void saveTask(task.id, { my_day_date: cursor })
+                }
+              >
+                <span>＋</span>
+                {task.title}
+              </button>
+            ))}
+          </div>
+        </section>
+      ) : null}
+
+      {isTodayView ? (
+        <aside className="myday-semantics">
+          <strong>今日同时汇总计划内、今天截止与已逾期任务。</strong>
+          <span>
+            安排到今天不会修改任务原本的截止日期。
+          </span>
+        </aside>
+      ) : null}
+
+      {isTodayView ? (
+        <div className="day-rituals">
+          <button
+            type="button"
+            className="btn-ghost"
+            onClick={() =>
+              void saveDaySnapshot(cursor, dayTasks, "morning").then(() =>
+                useAppStore.getState().setToast("晨间计划已保存"),
+              )
+            }
+          >
+            确认今日计划
+          </button>
+          <button
+            type="button"
+            className="btn-ghost"
+            onClick={openDayClose}
+          >
+            今日收尾
+          </button>
+        </div>
+      ) : null}
+
+      {isTodayView && closingDay ? (
+        <section className="day-close-panel">
+          <div>
+            <strong>今日收尾</strong>
+            <span>完成 {done} 项，还有 {pending} 项需要决定去向</span>
+          </div>
+          <textarea
+            className="field"
+            rows={2}
+            value={reflection}
+            onChange={(event) => setReflection(event.target.value)}
+            placeholder="今天最值得记录的一句话…"
+          />
+          {dayTasks.filter(isActiveTask).map((task) => (
+            <label key={task.id} className="day-close-task">
+              <span>{task.title}</span>
+              <select
+                className="field"
+                value={dispositions[task.id] ?? "tomorrow"}
+                onChange={(event) =>
+                  setDispositions((current) => ({
+                    ...current,
+                    [task.id]: event.target.value,
+                  }))
+                }
+              >
+                <option value="tomorrow">安排到明天</option>
+              <option value="remove">移出今日计划</option>
+                <option value="cancel">取消任务</option>
+              </select>
+            </label>
+          ))}
+          <div className="day-close-actions">
+            <button type="button" className="btn-ghost" onClick={() => setClosingDay(false)}>
+              稍后
+            </button>
+            <button
+              type="button"
+              className="btn-primary"
+              disabled={settlingDay}
+              onClick={() => void settleDay()}
+            >
+              {settlingDay ? "处理中…" : "完成收尾"}
+            </button>
+          </div>
+        </section>
+      ) : null}
+
+      {!isInboxView ? <div className="scope-summary">
+        {isTodayView ? (
+          <>
+            {cursor === today ? (
+              <div className="scope-card is-overdue">
+                <span>已逾期</span>
+                <strong>{overdueTasks.length}</strong>
+              </div>
+            ) : null}
+            <div className="scope-card">
+              <span>{cursor === today ? "今天到期" : "当日到期"}</span>
+              <strong>{dueOnCursor.length}</strong>
+            </div>
+            <div className="scope-card">
+              <span>今日计划</span>
+              <strong>
+                {dayTasks.filter((task) => task.my_day_date === today).length}
+              </strong>
+            </div>
+          </>
+        ) : (
+          <>
+            <div className="scope-card">
+              <span>待办</span>
+              <strong>{pending}</strong>
+            </div>
+            <div className="scope-card">
+              <span>已完成</span>
+              <strong>{done}</strong>
+            </div>
+          </>
+        )}
+      </div> : null}
+
+      <div className="day-agenda">
+        <h3 className="scope-section-title">
+          {isTodayView
+            ? cursor === today
+              ? "今日事项"
+              : "当日事项"
+            : isInboxView
+              ? "全部未完成任务"
+              : cursor === today ? "今日安排" : "当日安排"}
+        </h3>
+        {!dayTasks.length ? (
+          <div className="scope-empty">
+            {isTodayView
+              ? "今天还没有任务，可以从待办箱安排或新建一项。"
+              : isInboxView ? getEmptyMessage("inbox") : "这一天暂无任务"}
+          </div>
+        ) : isTodayView ? (
+          <>
+            {overdueTasks.length ? (
+              <section className="day-agenda-group is-overdue">
+                <h4>已逾期 · {overdueTasks.length}</h4>
+                {overdueTasks.map(renderDayTask)}
+              </section>
+            ) : null}
+            <section className="day-agenda-group">
+              <h4>
+                {cursor === today ? "今天到期" : "当日到期"} · {dueOnCursor.length}
+              </h4>
+              {dueOnCursor.length
+                ? dueOnCursor.map(renderDayTask)
+                : <div className="scope-empty">没有到期项</div>}
+            </section>
+            {plannedOnlyTasks.length ? <section className="day-agenda-group is-planned"><h4>今日计划 · {plannedOnlyTasks.length}</h4>{plannedOnlyTasks.map(renderDayTask)}</section> : null}
+          </>
+        ) : isInboxView ? (
+          <div className="inbox-task-groups">
+            {inboxGroups.filter((group) => group.tasks.length).map((group) => (
+              <section className={`inbox-task-group is-${group.id}`} key={group.id}>
+                <header>
+                  <div>
+                    <h4>{group.title}</h4>
+                    <p>{group.hint}</p>
+                  </div>
+                  <strong>{group.tasks.length}</strong>
+                </header>
+                <div>{group.tasks.map(renderDayTask)}</div>
+              </section>
+            ))}
+          </div>
+        ) : (
+          dayTasks.map(renderDayTask)
+        )}
+      </div>
+    </div>
+  );
+}
+
+function WeekBoard() {
+  const allTasks = useAppStore((s) => s.tasks);
+  const cursor = useAppStore((s) => s.calendarCursor);
+  const setCalendarCursor = useAppStore((s) => s.setCalendarCursor);
+  const selectTask = useAppStore((s) => s.selectTask);
+  const saveTask = useAppStore((s) => s.saveTask);
+  const bodyRef = useRef<HTMLDivElement>(null);
+  const today = todayDateString();
+  const weekStart = startOfWeek(cursor);
+  const days = weekDates(cursor);
+  const weekLabel = `${formatLongDate(days[0])} – ${parseDate(days[6]).getMonth() + 1}月${parseDate(days[6]).getDate()}日`;
+
+  const weekTasks = useMemo(() => {
+    const end = addDays(weekStart, 6);
+    return allTasks.filter(
+      (t) =>
+        !t.parent_id &&
+        !t.deleted_at &&
+        t.due_date !== null &&
+        t.due_date >= weekStart &&
+        t.due_date <= end,
+    );
+  }, [allTasks, weekStart]);
+
+  const pending = weekTasks.filter(isActiveTask).length;
+  const done = weekTasks.filter((t) => t.status === "completed").length;
+
+  const hourStart = 8;
+  const hours = Array.from({ length: 15 }, (_, i) => i + hourStart); // 08–22
+  const slotH = 48;
+  const now = new Date();
+  const nowDay = today;
+  const nowTop =
+    ((now.getHours() - hourStart) * 60 + now.getMinutes()) / 60 * slotH;
+
+  const weekday = ["日", "一", "二", "三", "四", "五", "六"];
+
+  // 自动滚到当前时间，避免晚上的任务看起来像“没显示”
+  useEffect(() => {
+    const el = bodyRef.current;
+    if (!el) return;
+    const target = Math.max(0, nowTop - 80);
+    el.scrollTop = target;
+  }, [weekStart, nowTop]);
+
+  return (
+    <div className="scope-board">
+      <div className="scope-nav">
+        <button
+          type="button"
+          className="btn-ghost"
+          onClick={() => setCalendarCursor(addDays(cursor, -7))}
+        >
+          ‹
+        </button>
+        <div className="week-board-title">
+          <span className="week-board-kicker">周历 · 按时间查看</span>
+          <strong>{weekLabel}</strong>
+        </div>
+        <button
+          type="button"
+          className="btn-ghost"
+          onClick={() => setCalendarCursor(addDays(cursor, 7))}
+        >
+          ›
+        </button>
+        <button
+          type="button"
+          className="btn-ghost"
+          onClick={() => setCalendarCursor(today)}
+        >
+          今日
+        </button>
+      </div>
+
+      <div className="scope-summary">
+        <div className="scope-card">
+          <span>本周待办</span>
+          <strong>{pending}</strong>
+        </div>
+        <div className="scope-card">
+          <span>本周完成</span>
+          <strong>{done}</strong>
+        </div>
+      </div>
+
+      {weekTasks.length ? (
+        <div className="week-task-strip">
+          {weekTasks.map((t) => (
+            <button
+              key={t.id}
+              type="button"
+              className={`week-chip ${t.status === "completed" ? "is-done" : ""}`}
+              onClick={() => selectTask(t.id)}
+              title={`${t.due_date} ${formatTimeRange(t.due_time, t.end_time)}`}
+            >
+              <span className="week-chip-date">
+                {t.due_date?.slice(5)} {formatTimeRange(t.due_time, t.end_time)}
+              </span>
+              {t.title}
+            </button>
+          ))}
+        </div>
+      ) : (
+        <div className="scope-empty">
+          本周暂无带日期的任务。若要按工作/生活等分类查看，请打开侧栏「周清单」。
+        </div>
+      )}
+
+      <div className="week-board" ref={bodyRef}>
+        <div className="week-head">
+          <div className="week-gutter" />
+          {days.map((date) => {
+            const d = parseDate(date);
+            return (
+              <div
+                key={date}
+                className={`week-day-head ${date === today ? "is-today" : ""}`}
+              >
+                <span>{weekday[d.getDay()]}</span>
+                <strong>{d.getDate()}</strong>
+              </div>
+            );
+          })}
+        </div>
+
+        <div className="week-allday">
+          <div className="week-gutter">
+            <span className="week-allday-label">全天</span>
+          </div>
+          {days.map((date) => (
+            <div key={date} className="week-allday-cell">
+              {weekTasks
+                .filter((t) => t.due_date === date && !t.due_time)
+                .map((t) => (
+                  <button
+                    key={t.id}
+                    type="button"
+                    className="week-allday-event"
+                    onClick={() => selectTask(t.id)}
+                  >
+                    {t.title}
+                  </button>
+                ))}
+            </div>
+          ))}
+        </div>
+
+        <div className="week-body">
+          <div className="week-gutter">
+            {hours.map((h) => (
+              <div key={h} className="week-hour" style={{ height: slotH }}>
+                {String(h).padStart(2, "0")}:00
+              </div>
+            ))}
+          </div>
+          {days.map((date) => (
+            <div
+              key={date}
+              className="week-col"
+              onDragOver={(e) => e.preventDefault()}
+              onDrop={(e) => {
+                e.preventDefault();
+                const id = e.dataTransfer.getData("text/task");
+                if (id) void saveTask(id, { due_date: date });
+              }}
+            >
+              {hours.map((h) => (
+                <div key={h} className="week-slot" style={{ height: slotH }} />
+              ))}
+              {date === nowDay &&
+              now.getHours() >= hourStart &&
+              now.getHours() <= hourStart + hours.length - 1 ? (
+                <div className="now-line week-now" style={{ top: nowTop }} />
+              ) : null}
+              {weekTasks
+                .filter((t) => t.due_date === date && t.due_time)
+                .map((t) => {
+                  const startMin = parseTimeToMinutes(t.due_time)!;
+                  const endMin =
+                    parseTimeToMinutes(t.end_time) ?? startMin + 60;
+                  const duration = Math.max(30, endMin - startMin);
+                  const top =
+                    ((startMin - hourStart * 60) / 60) * slotH;
+                  const height = Math.max(28, (duration / 60) * slotH);
+                  const timeLabel = formatTimeRange(t.due_time, t.end_time);
+                  const compact = height < 44;
+                  return (
+                    <div
+                      key={t.id}
+                      className={`week-event ${compact ? "is-compact" : ""} ${t.status === "completed" ? "is-done" : ""}`}
+                      style={{
+                        top: Math.max(0, top),
+                        height,
+                      }}
+                      title={`${timeLabel} ${t.title}`}
+                      draggable
+                      onDragStart={(e) =>
+                        e.dataTransfer.setData("text/task", t.id)
+                      }
+                      onClick={() => selectTask(t.id)}
+                    >
+                      {compact ? null : (
+                        <span className="week-event-time">{timeLabel}</span>
+                      )}
+                      <span className="week-event-title">{t.title}</span>
+                    </div>
+                  );
+                })}
+            </div>
+          ))}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+function MonthBoard() {
+  const allTasks = useAppStore((s) => s.tasks);
+  const cursor = useAppStore((s) => s.calendarCursor);
+  const setCalendarCursor = useAppStore((s) => s.setCalendarCursor);
+  const setDateScope = useAppStore((s) => s.setDateScope);
+  const selectTask = useAppStore((s) => s.selectTask);
+  const saveTask = useAppStore((s) => s.saveTask);
+  const today = todayDateString();
+
+  const year = Number(cursor.slice(0, 4));
+  const month = Number(cursor.slice(5, 7)) - 1;
+  const first = new Date(year, month, 1);
+  const startPad = first.getDay();
+  const daysInMonth = new Date(year, month + 1, 0).getDate();
+  const cells: { date: string | null; day: number | null }[] = [];
+  for (let i = 0; i < startPad; i++) cells.push({ date: null, day: null });
+  for (let d = 1; d <= daysInMonth; d++) {
+    const date = `${year}-${String(month + 1).padStart(2, "0")}-${String(d).padStart(2, "0")}`;
+    cells.push({ date, day: d });
+  }
+
+  const monthStart = `${year}-${String(month + 1).padStart(2, "0")}-01`;
+  const monthEnd = `${year}-${String(month + 1).padStart(2, "0")}-${String(daysInMonth).padStart(2, "0")}`;
+  const monthTasks = allTasks.filter(
+    (t) =>
+      !t.parent_id &&
+      !t.deleted_at &&
+      t.due_date !== null &&
+      t.due_date >= monthStart &&
+      t.due_date <= monthEnd,
+  );
+  const pending = monthTasks.filter(isActiveTask).length;
+  const done = monthTasks.filter((t) => t.status === "completed").length;
+
+  const shiftMonth = (delta: number) => {
+    const d = new Date(year, month + delta, 1);
+    setCalendarCursor(
+      `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-01`,
+    );
+  };
+
+  return (
+    <div className="scope-board">
+      <div className="scope-nav">
+        <button type="button" className="btn-ghost" onClick={() => shiftMonth(-1)}>
+          ‹
+        </button>
+        <strong>
+          {year}年{month + 1}月
+        </strong>
+        <button type="button" className="btn-ghost" onClick={() => shiftMonth(1)}>
+          ›
+        </button>
+        <button
+          type="button"
+          className="btn-ghost"
+          onClick={() => setCalendarCursor(today)}
+        >
+          今日
+        </button>
+      </div>
+
+      <div className="scope-summary">
+        <div className="scope-card">
+          <span>本月待办</span>
+          <strong>{pending || "本月无待办"}</strong>
+        </div>
+        <div className="scope-card">
+          <span>本月完成</span>
+          <strong>{done}</strong>
+        </div>
+      </div>
+
+      <div className="calendar-grid month-grid">
+        {["日", "一", "二", "三", "四", "五", "六"].map((w) => (
+          <div key={w} className="cal-weekday">
+            {w}
+          </div>
+        ))}
+        {cells.map((cell, idx) => (
+          <div
+            key={idx}
+            className={`cal-cell ${cell.date ? "" : "muted"} ${cell.date === today ? "is-today" : ""}`}
+            onClick={() => {
+              if (cell.date) {
+                setCalendarCursor(cell.date);
+                setDateScope("day");
+              }
+            }}
+            onDragOver={(e) => e.preventDefault()}
+            onDrop={(e) => {
+              e.preventDefault();
+              const id = e.dataTransfer.getData("text/task");
+              if (id && cell.date) void saveTask(id, { due_date: cell.date });
+            }}
+          >
+            {cell.day ? <div className="cal-day">{cell.day}</div> : null}
+            {cell.date
+              ? allTasks
+                  .filter(
+                    (t) =>
+                      !t.parent_id &&
+                      !t.deleted_at &&
+                      t.due_date === cell.date,
+                  )
+                  .slice(0, 3)
+                  .map((t) => (
+                    <div
+                      key={t.id}
+                      className="cal-task"
+                      draggable
+                      onDragStart={(e) => e.dataTransfer.setData("text/task", t.id)}
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        selectTask(t.id);
+                      }}
+                    >
+                      {t.title}
+                    </div>
+                  ))
+              : null}
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+function TrashView() {
+  const trashTasks = useAppStore((s) => s.trashTasks);
+  const restoreTask = useAppStore((s) => s.restoreTask);
+  const purgeTrash = useAppStore((s) => s.purgeTrash);
+
+  return (
+    <div className="task-scroll">
+      <div style={{ marginBottom: 12 }}>
+        <button
+          type="button"
+          className="btn-ghost danger"
+          disabled={!trashTasks.length}
+          onClick={() => {
+            if (window.confirm("确定清空回收站？")) void purgeTrash();
+          }}
+        >
+          清空回收站
+        </button>
+      </div>
+      {!trashTasks.length ? (
+        <div className="empty-state">{getEmptyMessage("trash")}</div>
+      ) : (
+        trashTasks.map((task) => (
+          <div key={task.id} className="task-row">
+            <div>
+              <p className="task-title">{task.title}</p>
+            </div>
+            <button type="button" className="btn-ghost" onClick={() => void restoreTask(task.id)}>
+              恢复
+            </button>
+          </div>
+        ))
+      )}
+    </div>
+  );
+}
+
+function TaskCollectionView({
+  tasks,
+  view,
+  statusFilter,
+  onStatusFilterChange,
+}: {
+  tasks: Task[];
+  view: string;
+  statusFilter: TaskStatusFilter;
+  onStatusFilterChange: (filter: TaskStatusFilter) => void;
+}) {
+  const active = tasks.filter(isActiveTask);
+  const completed = tasks.filter((task) => task.status === "completed");
+  const filteredTasks = view === "all"
+    ? filterTasksByStatus(tasks, statusFilter)
+    : tasks;
+  const sections = view === "all" && statusFilter === "all"
+    ? [
+        { id: "active", title: "未完成", tasks: active },
+        { id: "completed", title: "已完成", tasks: completed },
+      ]
+    : view === "all"
+      ? [{
+          id: statusFilter,
+          title: statusFilter === "completed" ? "完成记录" : "未完成",
+          tasks: filteredTasks,
+        }]
+    : [{ id: view, title: view === "completed" ? "完成记录" : "任务", tasks }];
+
+  return (
+    <div className="task-collection" data-view={view} data-filter={view === "all" ? statusFilter : undefined}>
+      {view === "all" ? (
+        <div className="task-status-filter" role="group" aria-label="按任务状态筛选">
+          {([
+            ["all", "全部", tasks.length],
+            ["active", "未完成", active.length],
+            ["completed", "已完成", completed.length],
+          ] as const).map(([id, label, count]) => (
+            <button
+              key={id}
+              type="button"
+              className={statusFilter === id ? "active" : ""}
+              aria-pressed={statusFilter === id}
+              onClick={() => onStatusFilterChange(id)}
+            >
+              <span>{label}</span>
+              <strong>{count}</strong>
+            </button>
+          ))}
+        </div>
+      ) : null}
+      {!filteredTasks.length ? (
+        <div className="empty-state">
+          {view === "all"
+            ? statusFilter === "completed"
+              ? "还没有完成记录。"
+              : statusFilter === "active"
+                ? "所有任务都已处理。"
+                : getEmptyMessage(view)
+            : getEmptyMessage(view)}
+        </div>
+      ) : sections.map((section) => (
+        <section className="task-list-section" key={section.id}>
+          <header className="task-list-section-head">
+            <h3>{section.title}</h3>
+            <span>{section.tasks.length}</span>
+          </header>
+          {section.tasks.length ? (
+            section.tasks.map((task) => (
+              <ExpandableTaskItem
+                key={task.id}
+                task={task}
+                meta={(
+                  <>
+                    <span>{formatDueDate(task.due_date)}</span>
+                    {task.due_time ? <span>{formatTimeRange(task.due_time, task.end_time)}</span> : null}
+                    <span>{priorityLabel(task.priority)}</span>
+                    {task.status === "completed" && task.completed_at ? (
+                      <span>完成于 {new Date(task.completed_at).toLocaleDateString("zh-CN")}</span>
+                    ) : null}
+                  </>
+                )}
+              />
+            ))
+          ) : (
+            <div className="task-list-section-empty">
+              {section.id === "active" ? "没有未完成任务" : "还没有完成记录"}
+            </div>
+          )}
+        </section>
+      ))}
+    </div>
+  );
+}
+
+export function MainWorkspace() {
+  const nav = useAppStore((s) => s.nav);
+  const setViewMode = useAppStore((s) => s.setViewMode);
+  const dateScope = useAppStore((s) => s.dateScope);
+  const setDateScope = useAppStore((s) => s.setDateScope);
+  const tasks = useAppStore((s) => s.tasks);
+  const tagMap = useAppStore((s) => s.tagMap);
+  const activeTagId = useAppStore((s) => s.activeTagId);
+  const filter = useAppStore((s) => s.filter);
+  const allTasksFilter = useAppStore((s) => s.allTasksFilter);
+  const setAllTasksFilter = useAppStore((s) => s.setAllTasksFilter);
+
+  const visible = useMemo(
+    () => filterTasksByView(tasks, nav, tagMap, activeTagId, filter),
+    [tasks, nav, tagMap, activeTagId, filter],
+  );
+
+  useEffect(() => {
+    if (nav === "board") setViewMode("board");
+    if (nav === "calendar") {
+      setViewMode("calendar");
+      setDateScope("month");
+    }
+  }, [nav, setViewMode, setDateScope]);
+
+  if (nav === "settings") {
+    return (
+      <Suspense fallback={<div className="empty-state">正在打开设置…</div>}>
+        <SettingsView />
+      </Suspense>
+    );
+  }
+  if (nav === "habits") {
+    return (
+      <Suspense fallback={<div className="empty-state">正在打开习惯…</div>}>
+        <HabitsView />
+      </Suspense>
+    );
+  }
+  if (nav === "reminders") {
+    return (
+      <main className="main-workspace">
+        <div className="workspace-top">
+          <h2>{getViewTitle("reminders")}</h2>
+          <PageCloseButton />
+        </div>
+        <Suspense fallback={<div className="empty-state">正在打开提醒…</div>}>
+          <RemindersView />
+        </Suspense>
+      </main>
+    );
+  }
+  if (nav === "review") {
+    return (
+      <Suspense fallback={<div className="empty-state">正在打开复盘…</div>}>
+        <ReviewView />
+      </Suspense>
+    );
+  }
+  if (nav === "week") {
+    return (
+      <Suspense fallback={<div className="empty-state">正在打开周清单…</div>}>
+        <WeeklyChecklistView />
+      </Suspense>
+    );
+  }
+  if (nav === "growth") return <Suspense fallback={<div className="empty-state">正在加载成长数据…</div>}><GrowthView /></Suspense>;
+  if (nav === "daily-reflection") return <Suspense fallback={<div className="empty-state">正在打开今日拾光…</div>}><MomentsView mode="today" /></Suspense>;
+  if (nav === "inspirations") return <Suspense fallback={<div className="empty-state">正在打开拾念箱…</div>}><MomentsView mode="ideas" /></Suspense>;
+  if (nav === "future-letters") return <Suspense fallback={<div className="empty-state">正在打开拾光变迁…</div>}><MomentsView mode="letters" /></Suspense>;
+  if (nav === "anniversaries") {
+    return (
+      <Suspense fallback={<div className="empty-state">正在打开纪念日…</div>}>
+        <AnniversariesView />
+      </Suspense>
+    );
+  }
+  if (nav === "memos") {
+    return (
+      <Suspense fallback={<div className="empty-state">正在加载备忘录…</div>}>
+        <MemosView />
+      </Suspense>
+    );
+  }
+  if (nav === "projects") {
+    return (
+      <Suspense fallback={<div className="empty-state">正在打开项目…</div>}>
+        <ProjectsView />
+      </Suspense>
+    );
+  }
+  if (nav === "toolbox") {
+    return (
+      <Suspense fallback={<div className="empty-state">正在打开工具箱…</div>}>
+        <ToolboxView />
+      </Suspense>
+    );
+  }
+  if (nav === "ledger" || nav === "ledger-budget") {
+    return <Suspense fallback={<div className="empty-state">正在打开观流账本…</div>}><LedgerView mode={nav === "ledger-budget" ? "budget" : "ledger"} /></Suspense>;
+  }
+  if (nav === "trash") {
+    return (
+      <main className="main-workspace">
+        <div className="workspace-top">
+          <h2>{getViewTitle("trash")}</h2>
+          <PageCloseButton />
+        </div>
+        <TrashView />
+      </main>
+    );
+  }
+
+  const isInboxView = nav === "inbox";
+  const isDateBoard = nav === "today" || nav === "calendar";
+  const showDateScope = isDateBoard;
+
+  return (
+    <main className="main-workspace">
+      <div className="workspace-top">
+        <div>
+          <div className={`workspace-title-line scope-${nav}`}><h2>{getViewTitle(nav)}</h2>{nav === "today" ? <span>今日行动</span> : nav === "inbox" ? <span>全周期</span> : null}</div>
+          {nav === "today" ? (
+            <p className="workspace-subtitle">今日计划、今天截止和已逾期任务集中处理。</p>
+          ) : null}
+          {nav === "inbox" ? (
+            <p className="workspace-subtitle">汇总所有未完成任务；日期只决定排序和提醒，不决定是否出现在待办箱。</p>
+          ) : null}
+          {nav === "all" ? (
+            <p className="workspace-subtitle">在同一个任务库中查看全部事项，并按完成状态快速筛选。</p>
+          ) : null}
+        </div>
+        <div className="top-controls">
+          {showDateScope ? (
+            <div className="seg">
+              {(["day", "week", "month"] as const).map((s) => (
+                <button
+                  key={s}
+                  type="button"
+                  className={dateScope === s ? "active" : ""}
+                  onClick={() => setDateScope(s)}
+                >
+                  {s === "day" ? "日" : s === "week" ? "周历" : "月"}
+                </button>
+              ))}
+            </div>
+          ) : null}
+          <TaskExportMenu />
+          <PageCloseButton />
+        </div>
+      </div>
+      <TagFilterBar />
+
+      {isInboxView || (isDateBoard && dateScope === "day") ? <DayBoard /> : null}
+      {isDateBoard && dateScope === "week" ? <WeekBoard /> : null}
+      {isDateBoard && dateScope === "month" ? <MonthBoard /> : null}
+      {nav === "board" ? <BoardView tasks={visible} /> : null}
+      {!isInboxView && !isDateBoard && nav !== "board" ? (
+        <TaskCollectionView
+          tasks={visible}
+          view={nav}
+          statusFilter={allTasksFilter}
+          onStatusFilterChange={setAllTasksFilter}
+        />
+      ) : null}
+    </main>
+  );
+}
