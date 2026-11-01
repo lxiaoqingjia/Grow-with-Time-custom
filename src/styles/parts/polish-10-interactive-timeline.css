@@ -1,0 +1,354 @@
+/* Interactive vertical day planner. It intentionally comes after the legacy
+   horizontal timeline rules so the old widget can be replaced without
+   changing the surrounding window shell. */
+.timeline-drawer.is-open {
+  width: min(470px, calc(100vw - 24px));
+  max-width: min(470px, calc(100vw - 24px));
+  z-index: 90;
+}
+
+.timeline-drawer.is-open .timeline-drawer-panel {
+  width: 100%;
+  max-height: min(82vh, 760px);
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+  border-radius: 24px;
+  border: 1px solid color-mix(in srgb, var(--border-strong) 55%, transparent);
+  background: color-mix(in srgb, var(--bg-panel) 94%, transparent);
+  box-shadow: 0 24px 70px rgba(29, 51, 87, 0.2), 0 2px 12px rgba(29, 51, 87, 0.08);
+  backdrop-filter: blur(22px) saturate(1.1);
+}
+
+.timeline-dock-head {
+  flex: 0 0 auto;
+  padding: 18px 18px 14px;
+  border-bottom: 1px solid var(--border);
+}
+
+.timeline-dock-title {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.timeline-dock-title > div { min-width: 0; }
+
+.timeline-dock-title > div > span {
+  color: var(--text-muted);
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: 0.04em;
+}
+
+.timeline-dock-title h3 {
+  margin: 3px 0 0;
+  color: var(--text-heading);
+  font-size: 20px;
+}
+
+.timeline-quick-add { width: 100%; margin-top: 12px; }
+
+.timeline-unscheduled {
+  flex: 0 0 auto;
+  padding: 12px 18px 14px;
+  background: color-mix(in srgb, var(--accent-soft) 42%, transparent);
+  border-bottom: 1px solid var(--border);
+}
+
+.timeline-unscheduled-head {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  margin-bottom: 8px;
+}
+
+.timeline-unscheduled-head strong { color: var(--text-heading); font-size: 12px; }
+.timeline-unscheduled-head span { color: var(--text-muted); font-size: 11px; }
+
+.timeline-unscheduled-list {
+  display: flex;
+  gap: 7px;
+  max-width: 100%;
+  overflow-x: auto;
+  padding-bottom: 2px;
+}
+
+.timeline-unscheduled-task {
+  display: inline-flex;
+  align-items: center;
+  flex: 0 0 auto;
+  max-width: 220px;
+  gap: 7px;
+  min-height: 32px;
+  padding: 6px 10px;
+  border: 1px solid color-mix(in srgb, var(--accent) 24%, var(--border));
+  border-radius: 999px;
+  color: var(--text-heading);
+  background: color-mix(in srgb, var(--bg-panel) 88%, transparent);
+  cursor: grab;
+  text-align: left;
+  user-select: none;
+}
+
+.timeline-unscheduled-task:active { cursor: grabbing; }
+
+.timeline-unscheduled-task > span:nth-child(2) {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.timeline-unscheduled-task small {
+  color: var(--text-muted);
+  font-size: 10px;
+  white-space: nowrap;
+}
+
+.timeline-task-dot {
+  width: 7px;
+  height: 7px;
+  flex: 0 0 auto;
+  border-radius: 50%;
+  background: #6c8fd9;
+}
+
+.timeline-task-dot.p1 { background: #e58d89; }
+.timeline-task-dot.p2 { background: #e8bd55; }
+.timeline-task-dot.p4,
+.timeline-task-dot.p5 { background: #9a75c5; }
+
+.timeline-v-body { flex: 1 1 auto; min-height: 0; padding: 0; }
+
+.timeline-v-scroll {
+  height: min(56vh, 540px);
+  min-height: 260px;
+  overflow: auto;
+  overscroll-behavior: contain;
+  scrollbar-width: thin;
+}
+
+.timeline-v-canvas { position: relative; min-width: 0; width: 100%; }
+
+.timeline-v-labels,
+.timeline-v-grid,
+.timeline-v-events {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+}
+
+.timeline-v-labels {
+  left: 0;
+  width: 58px;
+  z-index: 3;
+  pointer-events: none;
+  background: color-mix(in srgb, var(--bg-panel) 78%, transparent);
+  border-right: 1px solid var(--border);
+}
+
+.timeline-v-labels span {
+  position: absolute;
+  right: 9px;
+  color: var(--text-muted);
+  font-size: 10px;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.timeline-v-grid { left: 58px; right: 0; z-index: 1; pointer-events: none; }
+
+.timeline-v-grid > span {
+  position: absolute;
+  left: 0;
+  right: 0;
+  border-top: 1px dashed color-mix(in srgb, var(--border) 70%, transparent);
+}
+
+.timeline-v-grid > span.is-half {
+  border-top-style: solid;
+  border-top-color: color-mix(in srgb, var(--border) 82%, transparent);
+}
+
+.timeline-v-grid > span.is-hour {
+  border-top: 1px solid color-mix(in srgb, var(--border-strong) 55%, transparent);
+}
+
+.timeline-v-now {
+  position: absolute;
+  left: -4px;
+  right: 0;
+  height: 2px;
+  background: #e67577;
+  box-shadow: 0 0 0 3px color-mix(in srgb, #e67577 13%, transparent);
+}
+
+.timeline-v-now::before {
+  content: "";
+  position: absolute;
+  left: -4px;
+  top: -3px;
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: #e67577;
+}
+
+.timeline-v-events { left: 58px; right: 10px; z-index: 2; }
+
+.timeline-v-event {
+  position: absolute;
+  display: block;
+  min-width: 0;
+  padding: 9px 11px;
+  overflow: visible;
+  border: 1px solid color-mix(in srgb, #5f87d9 42%, var(--border));
+  border-radius: 11px;
+  color: #254269;
+  background: color-mix(in srgb, #b8d1ff 72%, var(--bg-panel));
+  box-shadow: 0 5px 12px rgba(59, 101, 168, 0.08);
+  cursor: grab;
+  text-align: left;
+  transition: box-shadow 120ms ease, transform 120ms ease, opacity 120ms ease;
+  user-select: none;
+}
+
+.timeline-v-event:active,
+.timeline-v-event.is-dragging { cursor: grabbing; }
+
+.timeline-v-event:hover,
+.timeline-v-event.is-focus {
+  z-index: 5;
+  transform: translateX(1px);
+  box-shadow: 0 8px 18px rgba(59, 101, 168, 0.16);
+}
+
+.timeline-v-event.is-dragging {
+  opacity: 0.84;
+  box-shadow: 0 14px 28px rgba(41, 71, 124, 0.25);
+}
+
+.timeline-v-event.p1 {
+  color: #6d3338;
+  border-color: color-mix(in srgb, #df898b 54%, var(--border));
+  background: color-mix(in srgb, #ffd1d1 78%, var(--bg-panel));
+}
+
+.timeline-v-event.p2 {
+  color: #66501c;
+  border-color: color-mix(in srgb, #e4c15e 54%, var(--border));
+  background: color-mix(in srgb, #ffedb7 78%, var(--bg-panel));
+}
+
+.timeline-v-event.p4,
+.timeline-v-event.p5 {
+  color: #563b71;
+  border-color: color-mix(in srgb, #a880c7 54%, var(--border));
+  background: color-mix(in srgb, #e8d0fa 78%, var(--bg-panel));
+}
+
+.timeline-v-event-copy {
+  display: flex;
+  min-width: 0;
+  height: 100%;
+  flex-direction: column;
+  gap: 3px;
+  pointer-events: none;
+}
+
+.timeline-v-event-copy strong {
+  display: -webkit-box;
+  overflow: hidden;
+  color: inherit;
+  font-size: 12px;
+  line-height: 1.35;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+}
+
+.timeline-v-event-copy small {
+  color: currentColor;
+  font-size: 10px;
+  font-variant-numeric: tabular-nums;
+  opacity: 0.78;
+}
+
+.timeline-v-event-copy em {
+  color: currentColor;
+  font-size: 10px;
+  font-style: normal;
+  opacity: 0.68;
+}
+
+.timeline-v-resize-handle {
+  position: absolute;
+  left: 0;
+  right: 0;
+  height: 10px;
+  z-index: 2;
+  cursor: ns-resize;
+}
+
+.timeline-v-resize-handle.is-start { top: -4px; }
+.timeline-v-resize-handle.is-end { bottom: -4px; }
+
+.timeline-v-resize-handle::after {
+  content: "";
+  position: absolute;
+  left: 50%;
+  width: 24px;
+  height: 3px;
+  border-radius: 99px;
+  background: currentColor;
+  opacity: 0;
+  transform: translateX(-50%);
+  transition: opacity 120ms ease;
+}
+
+.timeline-v-resize-handle.is-start::after { top: 4px; }
+.timeline-v-resize-handle.is-end::after { bottom: 4px; }
+.timeline-v-event:hover .timeline-v-resize-handle::after { opacity: 0.45; }
+
+.timeline-v-empty {
+  position: absolute;
+  top: 50%;
+  left: 20px;
+  right: 20px;
+  padding: 14px;
+  border: 1px dashed var(--border-strong);
+  border-radius: 12px;
+  color: var(--text-muted);
+  font-size: 12px;
+  text-align: center;
+}
+
+.timeline-task-popover { z-index: 120; }
+
+/* A task title should remain readable even when the quick actions are visible.
+   Privacy mode now masks it explicitly; normal mode gets two useful lines. */
+.day-agenda .expand-task-title-row .task-title,
+.scope-board .expand-task-title-row .task-title {
+  display: -webkit-box;
+  overflow: hidden;
+  white-space: normal;
+  text-overflow: ellipsis;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 2;
+}
+
+:root[data-theme="dark"] .timeline-drawer.is-open .timeline-drawer-panel,
+:root[data-theme="glass"] .timeline-drawer.is-open .timeline-drawer-panel {
+  background: color-mix(in srgb, #1c2738 94%, transparent);
+}
+
+:root[data-theme="dark"] .timeline-v-event,
+:root[data-theme="glass"] .timeline-v-event {
+  color: #dbe9ff;
+  border-color: rgba(124, 163, 231, 0.32);
+  background: rgba(69, 106, 168, 0.35);
+}
+
+@media (max-width: 720px) {
+  .timeline-drawer.is-open { width: calc(100vw - 24px); max-width: none; }
+}
