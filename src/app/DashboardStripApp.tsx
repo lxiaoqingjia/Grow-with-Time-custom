@@ -1,0 +1,1061 @@
+import { useEffect, useMemo, useRef, useState, type CSSProperties } from "react";
+import { getCurrentWebviewWindow } from "@tauri-apps/api/webviewWindow";
+import { notifyWidgetError, openMainWindow, runWidgetAction } from "@/lib/openMainWindow";
+import type { NavId } from "@/types";
+import { fetchTasks } from "@/lib/db/tasks";
+import { createMemo, fetchMemos, updateMemo } from "@/lib/db/memos";
+import { getSetting } from "@/lib/db/settings";
+import { isPrivacyModeEnabled } from "@/lib/privacy";
+import {
+  createInspiration,
+  fetchAnniversaries,
+  fetchDailyReflections,
+  fetchInspirations,
+} from "@/lib/db/moments";
+import { fetchHabitChecks, fetchHabits, toggleHabitCheck } from "@/lib/db/taxonomy";
+import { fetchTimers } from "@/lib/db/timers";
+import {
+  createLedgerTransaction,
+  fetchLedgerAccounts,
+  fetchLedgerCategories,
+  fetchLedgerTransactions,
+  formatLedgerMoney,
+  getLedgerBudget,
+  parseAmountToCents,
+  type LedgerAccount,
+  type LedgerCategory,
+  type LedgerKind,
+  type LedgerTransaction,
+} from "@/lib/db/ledger";
+import { formatLongDate, todayDateString } from "@/lib/dates";
+import {
+  anniversaryDatesInMonth,
+  formatAnniversaryAnchor,
+  listAnniversariesForWidget,
+} from "@/lib/anniversaries";
+import { emitDataChanged, bindVisibleDataRefresh } from "@/lib/widgetRefresh";
+import { restoreWidgetPosition } from "@/lib/widgetWindow";
+import { formatCountdown, liveRemaining } from "@/lib/timers";
+import type { Anniversary, Habit, HabitCheck, Inspiration, Memo, Task, Timer } from "@/types";
+
+const FALLBACK_QUOTES = [
+  "日进一步，拾光成河。",
+  "把今天过成值得回望的一天。",
+  "完成比完美更重要。",
+  "先动起来，节奏会自己来。",
+  "小事坚持，终成习惯。",
+];
+
+const PALETTES = [
+  { id: "cloud", name: "云雾浅色", color: "#e8eef5" },
+  { id: "ocean", name: "深海蓝", color: "#355b8a" },
+  { id: "mist", name: "雾霾蓝", color: "#60758d" },
+  { id: "apricot", name: "暖杏色", color: "#8b6554" },
+  { id: "sage", name: "鼠尾草绿", color: "#587569" },
+  { id: "twilight", name: "暮光紫", color: "#685d8d" },
+  { id: "graphite", name: "石墨黑", color: "#343b47" },
+] as const;
+
+function hexToRgb(hex: string) {
+  const value = hex.replace("#", "");
+  const normalized =
+    value.length === 3
+      ? value
+          .split("")
+          .map((part) => part + part)
+          .join("")
+      : value;
+  const parsed = Number.parseInt(normalized, 16);
+  return `${(parsed >> 16) & 255}, ${(parsed >> 8) & 255}, ${parsed & 255}`;
+}
+
+function isLightColor(hex: string) {
+  const value = hex.replace("#", "");
+  const normalized = value.length === 3
+    ? value.split("").map((part) => part + part).join("")
+    : value;
+  const parsed = Number.parseInt(normalized, 16);
+  if (Number.isNaN(parsed)) return false;
+  const red = (parsed >> 16) & 255;
+  const green = (parsed >> 8) & 255;
+  const blue = parsed & 255;
+  return (red * 299 + green * 587 + blue * 114) / 1000 >= 175;
+}
+
+function greetingForHour(hour: number) {
+  if (hour < 5) return "夜深了";
+  if (hour < 11) return "早上好";
+  if (hour < 14) return "中午好";
+  if (hour < 18) return "下午好";
+  return "晚上好";
+}
+
+function monthKey(date: Date) {
+  return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}`;
+}
+
+function dateKey(date: Date) {
+  return `${monthKey(date)}-${String(date.getDate()).padStart(2, "0")}`;
+}
+
+function weekdayLabel(date: Date) {
+  return ["日", "一", "二", "三", "四", "五", "六"][date.getDay()];
+}
+
+export function DashboardStripApp() {
+  const [tasks, setTasks] = useState<Task[]>([]);
+  const [memos, setMemos] = useState<Memo[]>([]);
+  const [habits, setHabits] = useState<Habit[]>([]);
+  const [checks, setChecks] = useState<HabitCheck[]>([]);
+  const [timers, setTimers] = useState<Timer[]>([]);
+  const [anniversaries, setAnniversaries] = useState<Anniversary[]>([]);
+  const [ledgerTransactions, setLedgerTransactions] = useState<LedgerTransaction[]>([]);
+  const [ledgerCategories, setLedgerCategories] = useState<LedgerCategory[]>([]);
+  const [ledgerAccounts, setLedgerAccounts] = useState<LedgerAccount[]>([]);
+  const [ledgerBudget, setLedgerBudget] = useState(0);
+  const [ledgerAmountsHidden, setLedgerAmountsHidden] = useState(false);
+  const [ledgerDefaultExpenseCategoryId, setLedgerDefaultExpenseCategoryId] = useState(0);
+  const [ledgerDefaultIncomeCategoryId, setLedgerDefaultIncomeCategoryId] = useState(0);
+  const [ledgerDefaultAccountId, setLedgerDefaultAccountId] = useState(0);
+  const [ledgerOpen, setLedgerOpen] = useState(false);
+  const [ledgerKind, setLedgerKind] = useState<LedgerKind>("expense");
+  const [ledgerAmount, setLedgerAmount] = useState("");
+  const [ledgerCategoryId, setLedgerCategoryId] = useState(0);
+  const [ledgerNote, setLedgerNote] = useState("");
+  const [ledgerError, setLedgerError] = useState("");
+  const [ledgerNotice, setLedgerNotice] = useState("");
+  const [quote, setQuote] = useState(FALLBACK_QUOTES[0]);
+  const [memoText, setMemoText] = useState("");
+  const [momentText, setMomentText] = useState("");
+  const [moments, setMoments] = useState<Inspiration[]>([]);
+  const [momentOpen, setMomentOpen] = useState(false);
+  const [selectedDate, setSelectedDate] = useState<string | null>(null);
+  const [selectedAnniversary, setSelectedAnniversary] = useState<Anniversary | null>(null);
+  const [selectedTimer, setSelectedTimer] = useState<Timer | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [nowMs, setNowMs] = useState(Date.now());
+  const [paletteOpen, setPaletteOpen] = useState(false);
+  const [privacyMode, setPrivacyMode] = useState(false);
+  const ledgerAmountRef = useRef<HTMLInputElement>(null);
+  const [month, setMonth] = useState(() => {
+    const value = new Date();
+    value.setDate(1);
+    value.setHours(0, 0, 0, 0);
+    return value;
+  });
+  const [color, setColor] = useState(() => {
+    try {
+      return localStorage.getItem("minimal.dashboard.color") ?? "#355b8a";
+    } catch {
+      return "#355b8a";
+    }
+  });
+  const [opacity, setOpacity] = useState(() => {
+    try {
+      const saved = localStorage.getItem("minimal.dashboard.opacity");
+      return saved === null ? 84 : Number(saved);
+    } catch {
+      return 84;
+    }
+  });
+
+  useEffect(() => {
+    try {
+      localStorage.setItem("minimal.dashboard.color", color);
+      localStorage.setItem("minimal.dashboard.opacity", String(opacity));
+    } catch {
+      /* ignore */
+    }
+  }, [color, opacity]);
+
+  const refresh = async () => {
+    const ledgerMonth = monthKey(new Date());
+    const [
+      nextTasks,
+      nextMemos,
+      nextHabits,
+      nextChecks,
+      nextTimers,
+      nextAnniversaries,
+      inspirations,
+      reflections,
+      privacySetting,
+      nextLedgerTransactions,
+      nextLedgerCategories,
+      nextLedgerAccounts,
+      nextLedgerBudget,
+      hideLedgerAmounts,
+      defaultExpenseCategoryId,
+      defaultIncomeCategoryId,
+      defaultAccountId,
+    ] = await Promise.all([
+      fetchTasks(),
+      fetchMemos(),
+      fetchHabits(),
+      fetchHabitChecks(),
+      fetchTimers(),
+      fetchAnniversaries(),
+      fetchInspirations(false),
+      fetchDailyReflections(),
+      getSetting("privacy_mode"),
+      fetchLedgerTransactions(ledgerMonth),
+      fetchLedgerCategories(),
+      fetchLedgerAccounts(),
+      getLedgerBudget(ledgerMonth),
+      getSetting("ledger_hide_amount"),
+      getSetting("ledger_default_expense_category_id"),
+      getSetting("ledger_default_income_category_id"),
+      getSetting("ledger_default_account_id"),
+    ]);
+    setTasks(nextTasks);
+    setMemos(nextMemos);
+    setHabits(nextHabits);
+    setChecks(nextChecks);
+    setTimers(nextTimers);
+    setAnniversaries(nextAnniversaries);
+    setMoments(inspirations.filter((item) => item.status !== "archived"));
+    setPrivacyMode(isPrivacyModeEnabled(privacySetting));
+    setLedgerTransactions(nextLedgerTransactions);
+    setLedgerCategories(nextLedgerCategories);
+    setLedgerAccounts(nextLedgerAccounts);
+    setLedgerBudget(nextLedgerBudget);
+    setLedgerAmountsHidden(hideLedgerAmounts === "true");
+    setLedgerDefaultExpenseCategoryId(Number(defaultExpenseCategoryId) || 0);
+    setLedgerDefaultIncomeCategoryId(Number(defaultIncomeCategoryId) || 0);
+    setLedgerDefaultAccountId(Number(defaultAccountId) || 0);
+
+    const today = todayDateString();
+    const highlight = reflections.find((item) => item.reflection_date === today)?.highlight?.trim();
+    const inspiration = inspirations.find((item) => item.status === "inbox")?.content?.trim();
+    if (highlight) setQuote(highlight);
+    else if (inspiration) setQuote(inspiration.slice(0, 48));
+    else setQuote(FALLBACK_QUOTES[Math.floor(Date.now() / 86_400_000) % FALLBACK_QUOTES.length]);
+  };
+
+  useEffect(() => {
+    document.documentElement.dataset.desktopWidget = "dashboard";
+    document.body.dataset.desktopWidget = "dashboard";
+    const unbind = bindVisibleDataRefresh(() => refresh(), { fallbackMs: 30_000 });
+    const tick = window.setInterval(() => {
+      setNowMs(Date.now());
+    }, 1_000);
+
+    const current = getCurrentWebviewWindow();
+    const positionKey = "minimal.dashboard.position";
+    void restoreWidgetPosition(current, positionKey);
+    let unlistenMoved: (() => void) | undefined;
+    void current
+      .onMoved(({ payload }) => {
+        localStorage.setItem(
+          positionKey,
+          JSON.stringify({ x: payload.x, y: payload.y }),
+        );
+      })
+      .then((unlisten) => {
+        unlistenMoved = unlisten;
+      });
+
+    return () => {
+      unbind();
+      window.clearInterval(tick);
+      unlistenMoved?.();
+      delete document.documentElement.dataset.desktopWidget;
+      delete document.body.dataset.desktopWidget;
+    };
+  }, []);
+
+  useEffect(() => {
+    if (!ledgerNotice) return;
+    const timer = window.setTimeout(() => setLedgerNotice(""), 3000);
+    return () => window.clearTimeout(timer);
+  }, [ledgerNotice]);
+
+  useEffect(() => {
+    if (!ledgerOpen && !momentOpen) return;
+    const closeOnEscape = (event: KeyboardEvent) => {
+      if (event.key === "Escape") {
+        setLedgerOpen(false);
+        setMomentOpen(false);
+      }
+    };
+    document.addEventListener("keydown", closeOnEscape);
+    return () => document.removeEventListener("keydown", closeOnEscape);
+  }, [ledgerOpen, momentOpen]);
+
+  const today = todayDateString();
+  const greeting = greetingForHour(new Date(nowMs).getHours());
+  const pendingToday = useMemo(
+    () =>
+      tasks.filter(
+        (task) =>
+          !task.parent_id &&
+          !task.deleted_at &&
+          !["completed", "cancelled"].includes(task.status) &&
+          task.due_date !== null &&
+          task.due_date <= today,
+      ).length,
+    [tasks, today],
+  );
+
+  const widgetAnniversaries = useMemo(
+    () => listAnniversariesForWidget(anniversaries, today, 4),
+    [anniversaries, today],
+  );
+
+  const anniversaryMonthDates = useMemo(
+    () =>
+      anniversaryDatesInMonth(
+        anniversaries,
+        month.getFullYear(),
+        month.getMonth(),
+      ),
+    [anniversaries, month],
+  );
+
+  const pinnedMemos = useMemo(
+    () =>
+      [...memos]
+        .sort((a, b) => b.pinned - a.pinned || b.updated_at.localeCompare(a.updated_at))
+        .slice(0, 4),
+    [memos],
+  );
+
+  const checkedToday = useMemo(() => {
+    const set = new Set(
+      checks.filter((item) => item.check_date === today).map((item) => item.habit_id),
+    );
+    return set;
+  }, [checks, today]);
+
+  const calendarDays = useMemo(() => {
+    const year = month.getFullYear();
+    const monthIndex = month.getMonth();
+    const firstWeekday = new Date(year, monthIndex, 1).getDay();
+    const startOffset = (firstWeekday + 6) % 7;
+    const start = new Date(year, monthIndex, 1 - startOffset);
+    return Array.from({ length: 42 }, (_, index) => {
+      const value = new Date(start);
+      value.setDate(start.getDate() + index);
+      return value;
+    });
+  }, [month]);
+
+  const taskDates = useMemo(() => {
+    const set = new Set<string>();
+    for (const task of tasks) {
+      if (
+        task.due_date &&
+        !task.deleted_at &&
+        !["completed", "cancelled"].includes(task.status)
+      ) {
+        set.add(task.due_date);
+      }
+    }
+    return set;
+  }, [tasks]);
+
+  const tasksByDate = useMemo(() => {
+    const map = new Map<string, Task[]>();
+    for (const task of tasks) {
+      if (!task.due_date || task.deleted_at) continue;
+      const list = map.get(task.due_date) ?? [];
+      list.push(task);
+      map.set(task.due_date, list);
+    }
+    for (const list of map.values()) list.sort((a, b) => (a.due_time ?? "99:99").localeCompare(b.due_time ?? "99:99"));
+    return map;
+  }, [tasks]);
+
+  const activeTimers = useMemo(
+    () =>
+      timers
+        .filter((timer) => timer.enabled)
+        .sort((a, b) => Number(b.running) - Number(a.running) || a.title.localeCompare(b.title))
+        .slice(0, 3),
+    [timers],
+  );
+
+  const ledgerExpense = useMemo(
+    () => ledgerTransactions
+      .filter((item) => item.type === "expense")
+      .reduce((sum, item) => sum + item.amount_cents, 0),
+    [ledgerTransactions],
+  );
+  const ledgerIncome = useMemo(
+    () => ledgerTransactions
+      .filter((item) => item.type === "income")
+      .reduce((sum, item) => sum + item.amount_cents, 0),
+    [ledgerTransactions],
+  );
+  const ledgerMasked = privacyMode || ledgerAmountsHidden;
+  const activeLedgerCategories = useMemo(
+    () => ledgerCategories.filter((item) => item.kind === ledgerKind && item.is_enabled),
+    [ledgerCategories, ledgerKind],
+  );
+
+  const defaultLedgerCategoryId = (kind: LedgerKind) => {
+    const configuredId = kind === "expense"
+      ? ledgerDefaultExpenseCategoryId
+      : ledgerDefaultIncomeCategoryId;
+    return ledgerCategories.find(
+      (item) => item.id === configuredId && item.kind === kind && item.is_enabled,
+    )?.id ?? ledgerCategories.find((item) => item.kind === kind && item.is_enabled)?.id ?? 0;
+  };
+
+  const defaultLedgerAccount = () =>
+    ledgerAccounts.find((item) => item.id === ledgerDefaultAccountId && item.is_enabled)
+    ?? ledgerAccounts.find((item) => item.is_enabled);
+
+  const chooseLedgerKind = (kind: LedgerKind) => {
+    setLedgerKind(kind);
+    setLedgerCategoryId(defaultLedgerCategoryId(kind));
+    setLedgerError("");
+  };
+
+  const openLedgerEntry = () => {
+    const defaultKind: LedgerKind = "expense";
+    setLedgerKind(defaultKind);
+    setLedgerCategoryId(defaultLedgerCategoryId(defaultKind));
+    setLedgerAmount("");
+    setLedgerNote("");
+    setLedgerError("");
+    setLedgerOpen(true);
+    window.setTimeout(() => ledgerAmountRef.current?.focus(), 80);
+  };
+
+  const saveLedgerEntry = async () => {
+    if (busy) return;
+    const amountCents = parseAmountToCents(ledgerAmount);
+    if (!amountCents) {
+      setLedgerError("请输入有效金额，最多两位小数");
+      ledgerAmountRef.current?.focus();
+      return;
+    }
+    const category = activeLedgerCategories.find((item) => item.id === ledgerCategoryId);
+    const account = defaultLedgerAccount();
+    if (!category || !account) {
+      setLedgerError(!category ? "请先选择可用分类" : "请先在主账本中启用一个账户");
+      return;
+    }
+    setBusy(true);
+    try {
+      await createLedgerTransaction({
+        kind: ledgerKind,
+        amountCents,
+        categoryId: category.id,
+        accountId: account.id,
+        occurredOn: today,
+        note: ledgerNote,
+      });
+      setLedgerOpen(false);
+      setLedgerNotice(
+        ledgerMasked
+          ? `已记入账本 · ${category.name}`
+          : `已记入账本 · ${category.name} ${formatLedgerMoney(amountCents)}`,
+      );
+      await refresh();
+      void emitDataChanged("ledger");
+    } catch (cause) {
+      setLedgerError(cause instanceof Error ? cause.message : "保存失败，请重试");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const saveMemo = async () => {
+    const content = memoText.trim();
+    if (!content || busy) return;
+    setBusy(true);
+    try {
+      await createMemo(content);
+      setMemoText("");
+      await refresh();
+      void emitDataChanged("memo");
+    } catch (cause) {
+      notifyWidgetError(cause, "保存备忘失败，请保留输入后重试");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const saveMoment = async () => {
+    const content = momentText.trim();
+    if (!content || busy) return;
+    setBusy(true);
+    try {
+      await createInspiration(content);
+      setMomentText("");
+      await refresh();
+      void emitDataChanged("moment");
+    } catch (cause) {
+      notifyWidgetError(cause, "保存时光便签失败，请保留输入后重试");
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const archiveMemo = async (memo: Memo) => runWidgetAction(
+    updateMemo(memo.id, { archived: 1 }).then(async () => {
+      await refresh();
+      await emitDataChanged("memo");
+    }),
+    "归档备忘录失败",
+  );
+
+  const toggleHabit = async (habitId: string) => runWidgetAction(
+    toggleHabitCheck(habitId, today).then(async () => {
+      await refresh();
+      await emitDataChanged("habit");
+    }),
+    "习惯打卡失败",
+  );
+
+  const openMain = (nav?: NavId) => void openMainWindow(nav);
+  const hideWidget = () => void runWidgetAction(
+    getCurrentWebviewWindow().hide(),
+    "隐藏组件失败",
+  );
+
+  return (
+    <main
+      className={`dashboard-strip ${opacity === 0 ? "is-fully-transparent" : ""} ${opacity > 0 && isLightColor(color) ? "is-light" : ""}`}
+      data-privacy={privacyMode ? "on" : "off"}
+      style={
+        {
+          "--widget-rgb": hexToRgb(color),
+          "--widget-opacity": opacity / 100,
+          "--widget-accent": color,
+        } as CSSProperties
+      }
+    >
+      <header className="dashboard-strip-head" data-tauri-drag-region>
+        <div className="dashboard-brand" data-tauri-drag-region>
+          <span className="dashboard-brand-mark" data-tauri-drag-region aria-hidden="true">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8">
+              <path d="M12 20V8" />
+              <path d="M12 12C8 12 5.5 9.8 5 6c4 0 6.5 2.2 7 6Z" />
+              <path d="M12 16c4 0 6.5-2.2 7-6-4 0-6.5 2.2-7 6Z" />
+            </svg>
+          </span>
+          <div className="dashboard-brand-copy" data-tauri-drag-region>
+            <strong data-tauri-drag-region>日进·拾光</strong>
+            <span data-tauri-drag-region>桌面仪表盘</span>
+          </div>
+        </div>
+        <div className="dashboard-sync" data-tauri-drag-region>
+          <i aria-hidden="true" />
+          <span data-tauri-drag-region>{formatLongDate(today)} · 数据已同步</span>
+        </div>
+        <div className="desktop-widget-actions">
+          <button
+            type="button"
+            title="调整配色"
+            aria-label="调整配色"
+            className={paletteOpen ? "is-active" : ""}
+            onClick={() => setPaletteOpen((value) => !value)}
+          >
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8">
+              <path d="M12 3a9 9 0 1 0 0 18c1.2 0 1.7-.9 1.2-1.8-.5-1-.1-2.2 1.4-2.2H17a4 4 0 0 0 4-4c0-5.5-4-10-9-10Z" />
+              <circle cx="7.5" cy="10" r="1" />
+              <circle cx="10" cy="6.8" r="1" />
+              <circle cx="15" cy="7.5" r="1" />
+            </svg>
+          </button>
+          <button type="button" title="打开主程序" aria-label="打开主程序" onClick={() => openMain()}>
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8">
+              <path d="M14 4h6v6M20 4 11 13" />
+              <path d="M18 13v6a1 1 0 0 1-1 1H5a1 1 0 0 1-1-1V7a1 1 0 0 1 1-1h6" />
+            </svg>
+          </button>
+          <button
+            type="button"
+            title="隐藏"
+            aria-label="隐藏组件"
+            onClick={hideWidget}
+          >
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8">
+              <path d="m6 6 12 12M18 6 6 18" />
+            </svg>
+          </button>
+        </div>
+      </header>
+
+      {paletteOpen ? (
+        <aside className="widget-palette dashboard-palette" aria-label="仪表盘配色">
+          <div className="widget-palette-title">
+            <strong>配色</strong>
+            <span>{opacity}%</span>
+          </div>
+          <div className="widget-palette-swatches">
+            {PALETTES.map((palette) => (
+              <button
+                key={palette.id}
+                type="button"
+                title={palette.name}
+                className={color === palette.color ? "is-active" : ""}
+                style={{ background: palette.color }}
+                onClick={() => setColor(palette.color)}
+              />
+            ))}
+          </div>
+          <label className="widget-opacity-control">
+            <span>透明度</span>
+            <input
+              type="range"
+              min="0"
+              max="96"
+              value={opacity}
+              onChange={(event) => setOpacity(Number(event.target.value))}
+            />
+          </label>
+        </aside>
+      ) : null}
+
+      <div className="dashboard-strip-body">
+        <section
+          className="dash-panel dash-greeting"
+          role="button"
+          tabIndex={0}
+          onClick={() => openMain("today")}
+          onKeyDown={(event) => {
+            if (event.key === "Enter" || event.key === " ") {
+              event.preventDefault();
+              openMain("today");
+            }
+          }}
+        >
+          <p className="dash-hello">{greeting}</p>
+          <p className="dash-date">
+            {formatLongDate(today)} · 周{weekdayLabel(new Date())}
+          </p>
+          <p className="dash-meta">今日待办 {pendingToday} 项</p>
+          {widgetAnniversaries[0] ? (
+            <p className="dash-meta dash-anni">
+              {`${widgetAnniversaries[0].item.title} · ${
+                widgetAnniversaries[0].daysLeft === null
+                  ? "已记录"
+                  : widgetAnniversaries[0].daysLeft === 0
+                  ? "就是今天"
+                  : `还有 ${widgetAnniversaries[0].daysLeft} 天`
+              }`}
+            </p>
+          ) : null}
+        </section>
+
+        <section className="dash-panel dash-memos">
+          <div
+            className="dash-panel-title is-link"
+            role="button"
+            tabIndex={0}
+            onClick={() => openMain("memos")}
+            onKeyDown={(event) => {
+              if (event.key === "Enter" || event.key === " ") {
+                event.preventDefault();
+                openMain("memos");
+              }
+            }}
+          >
+            备忘录
+          </div>
+          <ul>
+            {pinnedMemos.length === 0 ? (
+              <li className="dash-empty">暂无备忘</li>
+            ) : (
+              pinnedMemos.map((memo) => (
+                <li
+                  key={memo.id}
+                  className="is-clickable"
+                  role="button"
+                  tabIndex={0}
+                  onClick={() => openMain("memos")}
+                  onKeyDown={(event) => {
+                    if (event.key === "Enter" || event.key === " ") {
+                      event.preventDefault();
+                      openMain("memos");
+                    }
+                  }}
+                >
+                  <span>{memo.pinned ? "📌 " : ""}{(memo.title || memo.content).slice(0, 28)}</span>
+                  <button type="button" className="dash-memo-archive" title="归档" aria-label={`归档 ${memo.title || "备忘录"}`} onClick={(event) => { event.stopPropagation(); void archiveMemo(memo); }}>⌄</button>
+                </li>
+              ))
+            )}
+          </ul>
+          <form
+            className="dash-compose"
+            onSubmit={(event) => {
+              event.preventDefault();
+              void saveMemo();
+            }}
+          >
+            <input
+              value={memoText}
+              placeholder="速记一条…"
+              onChange={(event) => setMemoText(event.target.value)}
+            />
+            <button type="submit" disabled={busy || !memoText.trim()}>
+              +
+            </button>
+          </form>
+        </section>
+
+        <section className="dash-panel dash-habits">
+          <div
+            className="dash-panel-title is-link"
+            role="button"
+            tabIndex={0}
+            onClick={() => openMain("habits")}
+            onKeyDown={(event) => {
+              if (event.key === "Enter" || event.key === " ") {
+                event.preventDefault();
+                openMain("habits");
+              }
+            }}
+          >
+            打卡
+          </div>
+          <div className="dash-habit-list">
+            {habits.length === 0 ? (
+              <p className="dash-empty">暂无习惯</p>
+            ) : (
+              habits.slice(0, 5).map((habit) => {
+                const done = checkedToday.has(habit.id);
+                return (
+                  <button
+                    key={habit.id}
+                    type="button"
+                    className={`dash-habit ${done ? "is-done" : ""}`}
+                    onClick={() => void toggleHabit(habit.id)}
+                  >
+                    <span>{done ? "✓" : "○"}</span>
+                    {habit.title}
+                  </button>
+                );
+              })
+            )}
+          </div>
+        </section>
+
+        <section className="dash-panel dash-anniversaries">
+          <div
+            className="dash-panel-title is-link"
+            role="button"
+            tabIndex={0}
+            onClick={() => openMain("anniversaries")}
+            onKeyDown={(event) => {
+              if (event.key === "Enter" || event.key === " ") {
+                event.preventDefault();
+                openMain("anniversaries");
+              }
+            }}
+          >
+            纪念日
+          </div>
+          {widgetAnniversaries.length === 0 ? (
+            <p className="dash-empty">还没有纪念日</p>
+          ) : (
+            <ul>
+              {widgetAnniversaries.map(({ item, daysLeft }) => (
+                <li
+                  key={item.id}
+                  className={`is-clickable ${daysLeft === 0 ? "is-today" : ""}`}
+                  role="button"
+                  tabIndex={0}
+                  onClick={() => setSelectedAnniversary(item)}
+                  onKeyDown={(event) => {
+                    if (event.key === "Enter" || event.key === " ") {
+                      event.preventDefault();
+                      setSelectedAnniversary(item);
+                    }
+                  }}
+                >
+                  <span>{item.title}</span>
+                  <strong>{daysLeft === null ? "已记录" : daysLeft === 0 ? "今天" : `${daysLeft}天`}</strong>
+                  <em>{formatAnniversaryAnchor(item)}</em>
+                </li>
+              ))}
+            </ul>
+          )}
+        </section>
+
+        <section className="dash-panel dash-calendar">
+          <div className="dash-panel-title dash-cal-toolbar">
+            <button
+              type="button"
+              onClick={() =>
+                setMonth(new Date(month.getFullYear(), month.getMonth() - 1, 1))
+              }
+            >
+              ‹
+            </button>
+            <strong>
+              {month.getFullYear()}年{month.getMonth() + 1}月
+            </strong>
+            <button
+              type="button"
+              onClick={() =>
+                setMonth(new Date(month.getFullYear(), month.getMonth() + 1, 1))
+              }
+            >
+              ›
+            </button>
+          </div>
+          <div className="dash-cal-grid">
+            {["一", "二", "三", "四", "五", "六", "日"].map((label) => (
+              <span key={label} className="dash-cal-dow">
+                {label}
+              </span>
+            ))}
+            {calendarDays.map((day) => {
+              const key = dateKey(day);
+              const inMonth = day.getMonth() === month.getMonth();
+              const anniTitles = anniversaryMonthDates.get(key);
+              return (
+                <span
+                  key={key}
+                  title={
+                    privacyMode && anniTitles?.length
+                      ? "隐私模式已开启"
+                      : anniTitles?.join("、") || "打开主窗口"
+                  }
+                  role="button"
+                  tabIndex={0}
+                  onClick={() => setSelectedDate(key)}
+                  onKeyDown={(event) => {
+                    if (event.key === "Enter" || event.key === " ") {
+                      event.preventDefault();
+                      setSelectedDate(key);
+                    }
+                  }}
+                  className={[
+                    "dash-cal-day",
+                    inMonth ? "" : "is-out",
+                    key === today ? "is-today" : "",
+                    taskDates.has(key) ? "has-task" : "",
+                    anniTitles?.length ? "has-anni" : "",
+                  ]
+                    .filter(Boolean)
+                    .join(" ")}
+                >
+                  {day.getDate()}
+                </span>
+              );
+            })}
+          </div>
+        </section>
+
+        <section className="dash-panel dash-timers">
+          <div
+            className="dash-panel-title is-link"
+            role="button"
+            tabIndex={0}
+            onClick={() => openMain("reminders")}
+            onKeyDown={(event) => {
+              if (event.key === "Enter" || event.key === " ") {
+                event.preventDefault();
+                openMain("reminders");
+              }
+            }}
+          >
+            倒计时
+          </div>
+          {activeTimers.length === 0 ? (
+            <p className="dash-empty">暂无倒计时</p>
+          ) : (
+            <ul>
+              {activeTimers.map((timer) => (
+                <li
+                  key={timer.id}
+                  className="is-clickable"
+                  role="button"
+                  tabIndex={0}
+                  onClick={() => setSelectedTimer(timer)}
+                  onKeyDown={(event) => {
+                    if (event.key === "Enter" || event.key === " ") {
+                      event.preventDefault();
+                      setSelectedTimer(timer);
+                    }
+                  }}
+                >
+                  <span>{timer.title}</span>
+                  <strong className={timer.running ? "is-running" : ""}>
+                    {formatCountdown(liveRemaining(timer, nowMs))}
+                  </strong>
+                </li>
+              ))}
+            </ul>
+          )}
+        </section>
+
+        <section
+          className="dash-panel dash-ledger"
+          role="button"
+          tabIndex={0}
+          aria-label="打开快捷记账"
+          onClick={openLedgerEntry}
+          onKeyDown={(event) => {
+            if (event.key === "Enter" || event.key === " ") {
+              event.preventDefault();
+              openLedgerEntry();
+            }
+          }}
+        >
+          <div className="dash-panel-title">
+            <span>本月账本</span>
+            <span className="dash-ledger-add" aria-hidden="true">＋</span>
+          </div>
+          <div className="dash-ledger-balance">
+            <span>结余</span>
+            <strong>{formatLedgerMoney(ledgerIncome - ledgerExpense, ledgerMasked)}</strong>
+          </div>
+          <div className="dash-ledger-flow">
+            <div><span>收入</span><strong>{formatLedgerMoney(ledgerIncome, ledgerMasked)}</strong></div>
+            <i />
+            <div><span>支出</span><strong>{formatLedgerMoney(ledgerExpense, ledgerMasked)}</strong></div>
+          </div>
+          <div className="dash-ledger-budget">
+            <span>预算</span>
+            <div><i style={{ width: `${ledgerBudget ? Math.min(100, ledgerExpense / ledgerBudget * 100) : 0}%` }} /></div>
+            <b>{ledgerBudget ? (ledgerMasked ? "••••" : `${Math.round(ledgerExpense / ledgerBudget * 100)}%`) : "未设"}</b>
+          </div>
+          <div className="dash-ledger-latest">
+            {ledgerTransactions.length ? ledgerTransactions.slice(0, 2).map((item) => (
+              <div key={item.id}>
+                <span>{item.category_name}{item.note ? ` · ${item.note}` : ""}</span>
+                <strong className={item.type}>{item.type === "expense" ? "−" : "+"}{formatLedgerMoney(item.amount_cents, ledgerMasked)}</strong>
+              </div>
+            )) : <p className="dash-empty">记下第一笔，开始看见流向</p>}
+          </div>
+        </section>
+      </div>
+
+      <footer className="dashboard-strip-quote">
+        <button type="button" className="dash-moment-trigger" onClick={() => setMomentOpen(true)}>
+          时光便签
+          <span>{moments[0]?.content.slice(0, 18) || "记下刚刚闪过的一念"}</span>
+        </button>
+        <p data-tauri-drag-region>{quote}</p>
+      </footer>
+
+      {ledgerOpen || momentOpen ? <button type="button" className="dash-ledger-scrim" aria-label="关闭面板" onClick={() => { setLedgerOpen(false); setMomentOpen(false); }} /> : null}
+
+      {momentOpen ? (
+        <section className="dash-moment-drawer" role="dialog" aria-modal="true" aria-labelledby="dash-moment-title">
+          <header>
+            <div>
+              <strong id="dash-moment-title">时光便签</strong>
+              <small>从桌面随手收起一念</small>
+            </div>
+            <button type="button" onClick={() => setMomentOpen(false)} aria-label="关闭时光便签">×</button>
+          </header>
+          <form
+            onSubmit={(event) => {
+              event.preventDefault();
+              void saveMoment();
+            }}
+          >
+            <input
+              value={momentText}
+              onChange={(event) => setMomentText(event.target.value)}
+              placeholder="留住刚刚闪过的一念…"
+              autoFocus
+            />
+            <button type="submit" disabled={busy || !momentText.trim()}>收好</button>
+          </form>
+          <div className="dash-moment-list">
+            {moments.length ? moments.slice(0, 8).map((item) => (
+              <article key={item.id}>
+                <p>{item.content}</p>
+                <time>{new Date(item.created_at).toLocaleString()}</time>
+              </article>
+            )) : <p className="dash-empty">还没有便签，写下第一句。</p>}
+          </div>
+        </section>
+      ) : null}
+
+      {ledgerOpen ? (
+        <section
+          className="dash-ledger-entry"
+          role="dialog"
+          aria-modal="true"
+          aria-labelledby="dash-ledger-entry-title"
+        >
+          <form
+            className="dash-ledger-entry-form"
+            onSubmit={(event) => {
+              event.preventDefault();
+              void saveLedgerEntry();
+            }}
+          >
+            <header>
+              <div>
+                <i aria-hidden="true" />
+                <span>
+                  <strong id="dash-ledger-entry-title">快速记一笔</strong>
+                  <small>今天 · 自动同步到账本</small>
+                </span>
+              </div>
+              <button type="button" onClick={() => setLedgerOpen(false)} aria-label="关闭快捷记账">×</button>
+            </header>
+            <div className="dash-ledger-entry-main">
+              <div className="dash-ledger-kind" aria-label="收支类型">
+                <button type="button" className={ledgerKind === "expense" ? "is-active" : ""} onClick={() => chooseLedgerKind("expense")}>支出</button>
+                <button type="button" className={ledgerKind === "income" ? "is-active" : ""} onClick={() => chooseLedgerKind("income")}>收入</button>
+              </div>
+              <label className="dash-ledger-amount">
+                <span>¥</span>
+                <input
+                  ref={ledgerAmountRef}
+                  inputMode="decimal"
+                  value={ledgerAmount}
+                  onChange={(event) => {
+                    setLedgerAmount(event.target.value.replace(/[^\d.]/g, ""));
+                    setLedgerError("");
+                  }}
+                  aria-label="金额"
+                  aria-invalid={Boolean(ledgerError)}
+                  placeholder="0.00"
+                />
+              </label>
+            </div>
+            <div className="dash-ledger-categories" aria-label="账目分类">
+              {activeLedgerCategories.slice(0, 5).map((category) => (
+                <button
+                  key={category.id}
+                  type="button"
+                  className={ledgerCategoryId === category.id ? "is-active" : ""}
+                  onClick={() => {
+                    setLedgerCategoryId(category.id);
+                    setLedgerError("");
+                  }}
+                >
+                  {category.name}
+                </button>
+              ))}
+            </div>
+            <div className="dash-ledger-entry-footer">
+              <input
+                value={ledgerNote}
+                onChange={(event) => setLedgerNote(event.target.value)}
+                maxLength={80}
+                aria-label="备注"
+                placeholder="备注（可选）"
+              />
+              <span className="dash-ledger-account"><i aria-hidden="true" />{defaultLedgerAccount()?.name ?? "未设置账户"}</span>
+              <button type="submit" disabled={busy}>{busy ? "保存中…" : "记入账本"}</button>
+            </div>
+            {ledgerError ? <p className="dash-ledger-error" role="alert">{ledgerError}</p> : null}
+          </form>
+        </section>
+      ) : null}
+
+      {ledgerNotice ? <div className="dash-ledger-toast" role="status"><i />{ledgerNotice}</div> : null}
+
+      {selectedDate ? <div className="dash-detail-backdrop" onMouseDown={() => setSelectedDate(null)}><section className="dash-detail-card dash-day-detail" role="dialog" aria-modal="true" aria-label={`${selectedDate} 代办详情`} onMouseDown={(event) => event.stopPropagation()}><header><div><span>每日代办</span><strong>{new Date(`${selectedDate}T12:00:00`).toLocaleDateString("zh-CN", { month: "long", day: "numeric", weekday: "long" })}</strong></div><button onClick={() => setSelectedDate(null)} aria-label="关闭">×</button></header><div className="dash-detail-scroll">{(tasksByDate.get(selectedDate) ?? []).length ? (tasksByDate.get(selectedDate) ?? []).map((task) => <article className="dash-day-task" key={task.id}><i className={`is-${task.status}`} /><div><strong>{task.title}</strong><span>{task.due_time ? `${task.due_time}${task.end_time ? `–${task.end_time}` : ""}` : "全天"} · {task.status === "completed" ? "已完成" : task.status === "cancelled" ? "已取消" : "待完成"}</span>{task.description ? <p>{task.description}</p> : null}</div></article>) : <div className="dash-detail-empty">这一天没有代办。</div>}</div><footer><button onClick={() => openMain("calendar")}>在日历中查看</button></footer></section></div> : null}
+
+      {selectedAnniversary ? <div className="dash-detail-backdrop" onMouseDown={() => setSelectedAnniversary(null)}><section className="dash-detail-card dash-anniversary-detail" role="dialog" aria-modal="true" aria-label="纪念日详情" onMouseDown={(event) => event.stopPropagation()}><header><div><span>重要的日子</span><strong>{selectedAnniversary.title}</strong></div><button onClick={() => setSelectedAnniversary(null)} aria-label="关闭">×</button></header><div className="dash-anniversary-date"><b>{formatAnniversaryAnchor(selectedAnniversary)}</b><small>{selectedAnniversary.recur_yearly ? "每年提醒" : "仅记录一次"}</small></div>{selectedAnniversary.note ? <p>{selectedAnniversary.note}</p> : <p className="dash-detail-empty">还没有留下备注。</p>}<footer><button onClick={() => openMain("anniversaries")}>进入纪念日详情页</button></footer></section></div> : null}
+
+      {selectedTimer ? <div className="dash-detail-backdrop" onMouseDown={() => setSelectedTimer(null)}><section className="dash-detail-card dash-timer-detail" role="dialog" aria-modal="true" aria-label="倒计时详情" onMouseDown={(event) => event.stopPropagation()}><header><div><span>{selectedTimer.kind === "interval" ? "循环提醒" : "倒计时"}</span><strong>{selectedTimer.title}</strong></div><button onClick={() => setSelectedTimer(null)} aria-label="关闭">×</button></header><div className={`dash-timer-orbit ${selectedTimer.running ? "is-running" : ""}`}><div><strong>{formatCountdown(liveRemaining(selectedTimer, nowMs))}</strong><span>{selectedTimer.running ? "正在流动" : "已暂停"}</span></div></div><p>{selectedTimer.kind === "interval" ? "按设定节奏循环提醒你。" : "到点后会通过系统通知提醒。"}</p><footer><button onClick={() => openMain("reminders")}>管理倒计时</button></footer></section></div> : null}
+    </main>
+  );
+}
