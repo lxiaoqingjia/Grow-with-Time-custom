@@ -1,0 +1,1131 @@
+import { create } from "zustand";
+import type {
+  AiSettings,
+  AppSettings,
+  Attachment,
+  FilterState,
+  Habit,
+  HabitCheck,
+  NavId,
+  Project,
+  SmartList,
+  Tag,
+  Task,
+  TaskDraft,
+  TaskUpdate,
+  TaskTemplate,
+  TaskStatusFilter,
+  ThemeMode,
+  Timer,
+  TimerDraft,
+  ViewMode,
+  DateScope,
+} from "@/types";
+import * as db from "@/lib/db";
+import { addDays, nowIso, todayDateString } from "@/lib/dates";
+import {
+  focusEndsAtFromRemaining,
+  remainingFocusSeconds,
+} from "@/lib/focusTimer";
+import { emitDataChanged } from "@/lib/widgetRefresh";
+import { interpretOpenFocus, toSafeIso, type FocusRecovery } from "@/lib/focusRecovery";
+import { buildTodayPlanPicker, type MorningPlanItem } from "@/lib/morningPlan";
+import {
+  EMPTY_REMINDER_SYNC,
+  type ReminderSyncStatus,
+} from "@/lib/nativeReminders";
+import { invoke } from "@tauri-apps/api/core";
+import { emit } from "@tauri-apps/api/event";
+import { syncWindowChrome } from "@/lib/windowChrome";
+import { errorMessage } from "@/lib/errors";
+
+const emptyFilter = (): FilterState => ({
+  keyword: "",
+  dateFrom: null,
+  dateTo: null,
+  priorities: [],
+  tagIds: [],
+});
+
+const pendingCompleteIds = new Set<string>();
+
+interface AppStore {
+  ready: boolean;
+  error: string | null;
+  tasks: Task[];
+  trashTasks: Task[];
+  tags: Tag[];
+  tagMap: Record<string, string[]>;
+  smartLists: SmartList[];
+  habits: Habit[];
+  habitChecks: HabitCheck[];
+  timers: Timer[];
+  attachments: Attachment[];
+  projects: Project[];
+  taskTemplates: TaskTemplate[];
+  settings: AppSettings;
+  nav: NavId;
+  viewMode: ViewMode;
+  dateScope: DateScope;
+  calendarCursor: string;
+  selectedTaskId: string | null;
+  detailPreferEdit: boolean;
+  createTaskOpen: boolean;
+  activeTagId: string | null;
+  activeSmartListId: string | null;
+  filter: FilterState;
+  allTasksFilter: TaskStatusFilter;
+  focusTaskId: string | null;
+  focusSeconds: number;
+  focusEndsAt: number | null;
+  focusRunning: boolean;
+  focusSessionId: string | null;
+  pendingFocusRecovery: FocusRecovery | null;
+  pendingMorningPlan: MorningPlanItem[] | null;
+  reminderSync: ReminderSyncStatus;
+  toast: string | null;
+  canUndo: boolean;
+  _undoAction: (() => Promise<void>) | null;
+  navigationGuard: (() => boolean) | null;
+
+  bootstrap: () => Promise<void>;
+  maybeRollover: () => Promise<void>;
+  refreshAll: () => Promise<void>;
+  setNav: (nav: NavId) => void;
+  setAllTasksFilter: (filter: TaskStatusFilter) => void;
+  setNavigationGuard: (guard: (() => boolean) | null) => void;
+  setViewMode: (mode: ViewMode) => void;
+  setDateScope: (scope: DateScope) => void;
+  setCalendarCursor: (date: string) => void;
+  selectTask: (id: string | null, opts?: { edit?: boolean }) => void;
+  openCreateTask: () => void;
+  closeCreateTask: () => void;
+  setActiveTag: (id: string | null) => void;
+  setFilter: (patch: Partial<FilterState>) => void;
+  setToast: (msg: string | null) => void;
+  undo: () => Promise<void>;
+
+  addTask: (draft: TaskDraft) => Promise<Task | null>;
+  saveTask: (id: string, updates: TaskUpdate) => Promise<void>;
+  toggleComplete: (id: string) => Promise<void>;
+  deleteTask: (id: string) => Promise<void>;
+  batchComplete: (ids: string[]) => Promise<void>;
+  batchDelete: (ids: string[]) => Promise<void>;
+  restoreTask: (id: string) => Promise<void>;
+  purgeTrash: () => Promise<void>;
+  reorder: (ids: string[]) => Promise<void>;
+
+  addTag: (name: string) => Promise<void>;
+  removeTag: (id: string) => Promise<void>;
+  setTaskTags: (taskId: string, tagIds: string[]) => Promise<void>;
+  addProject: (name: string) => Promise<void>;
+  archiveProject: (id: string) => Promise<void>;
+  saveTemplate: (name: string, draft: TaskDraft) => Promise<void>;
+  useTemplate: (id: string) => Promise<void>;
+  removeTemplate: (id: string) => Promise<void>;
+
+  saveSmartList: (name: string) => Promise<void>;
+  removeSmartList: (id: string) => Promise<void>;
+  applySmartList: (id: string) => void;
+
+  addAttachment: (
+    taskId: string,
+    data: { kind: Attachment["kind"]; name: string; path: string },
+  ) => Promise<void>;
+  removeAttachment: (id: string) => Promise<void>;
+  loadAttachments: (taskId: string) => Promise<void>;
+
+  addHabit: (title: string, target?: number) => Promise<void>;
+  removeHabit: (id: string) => Promise<void>;
+  toggleHabitDay: (habitId: string, date: string) => Promise<void>;
+
+  addTimer: (draft: TimerDraft) => Promise<Timer | null>;
+  startTimer: (id: string) => Promise<void>;
+  pauseTimer: (id: string) => Promise<void>;
+  resetTimer: (id: string) => Promise<void>;
+  extendTimer: (id: string, additionalSec: number) => Promise<void>;
+  removeTimer: (id: string) => Promise<void>;
+  refreshTimers: () => Promise<void>;
+  settleTimers: () => Promise<db.FiredTimer[]>;
+
+  setTheme: (theme: ThemeMode) => Promise<void>;
+  updateSettings: (patch: Partial<AppSettings>) => Promise<void>;
+  saveAi: (ai: AiSettings) => Promise<void>;
+
+  setFocusTask: (id: string | null) => void;
+  tickFocus: () => void;
+  persistFocusHeartbeat: (hidden?: boolean) => void;
+  toggleFocus: () => Promise<void>;
+  resetFocus: () => Promise<void>;
+  resolveFocusRecovery: (
+    action: "continue" | "settle_activity" | "settle_planned" | "abandon",
+  ) => Promise<void>;
+  openMorningPlan: () => Promise<void>;
+  resolveMorningPlan: (
+    payload: { taskIds: string[]; titles?: string[] } | null,
+  ) => Promise<void>;
+  setReminderSync: (status: ReminderSyncStatus) => void;
+}
+
+function applyTheme(theme: ThemeMode) {
+  document.documentElement.dataset.theme = theme;
+  void syncWindowChrome(theme);
+}
+
+let lastFocusHeartbeatWrite = 0;
+const FOCUS_HEARTBEAT_MS = 15_000;
+
+export const useAppStore = create<AppStore>((set, get) => ({
+  ready: false,
+  error: null,
+  tasks: [],
+  trashTasks: [],
+  tags: [],
+  tagMap: {},
+  smartLists: [],
+  habits: [],
+  habitChecks: [],
+  timers: [],
+  attachments: [],
+  projects: [],
+  taskTemplates: [],
+  settings: {
+    theme: "system",
+    notifyAhead: 30,
+    autostart: false,
+    privacyMode: false,
+    autoBackup: true,
+    autoBackupLastOk: null,
+    autoBackupLastError: null,
+    autoBackupFailStreak: 0,
+    desktopWidgetMode: "dashboard",
+    desktopWidgetLayer: "bottom",
+    ai: { baseUrl: "https://api.openai.com/v1", apiKey: "", model: "gpt-4o-mini" },
+    onboardingComplete: false,
+  },
+  nav: "today",
+  viewMode: "board",
+  dateScope: "day",
+  calendarCursor: todayDateString(),
+  selectedTaskId: null,
+  detailPreferEdit: false,
+  createTaskOpen: false,
+  activeTagId: null,
+  activeSmartListId: null,
+  filter: emptyFilter(),
+  allTasksFilter: "all",
+  focusTaskId: null,
+  focusSeconds: 25 * 60,
+  focusEndsAt: null,
+  focusRunning: false,
+  focusSessionId: null,
+  pendingFocusRecovery: null,
+  pendingMorningPlan: null,
+  reminderSync: EMPTY_REMINDER_SYNC,
+  toast: null,
+  canUndo: false,
+  _undoAction: null,
+  navigationGuard: null,
+
+  bootstrap: async () => {
+    try {
+      const today = todayDateString();
+      const rolled = await db.rolloverOverdueTasks();
+      await db.backfillGeneratedFromIds();
+      const staleFocusClosed = await db.abandonStaleOpenFocusSessions();
+      const purgedLedgerRows = await db.purgeOldLedgerTrash();
+      await get().refreshAll();
+      applyTheme(get().settings.theme);
+      const openFocus = await db.fetchOpenFocusSessions();
+      const persistedFocus = await db.loadActiveFocus();
+      if (!openFocus.length) {
+        await db.saveActiveFocus(null);
+      } else {
+        const latest = openFocus[0];
+        const extras = openFocus.slice(1);
+        set({
+          pendingFocusRecovery: interpretOpenFocus(
+            latest,
+            persistedFocus,
+            Date.now(),
+            25 * 60,
+            extras,
+          ),
+        });
+      }
+      set({
+        ready: true,
+        error: null,
+        calendarCursor: today,
+        ...(purgedLedgerRows > 0
+          ? { toast: `已清理 ${purgedLedgerRows} 条超过 30 天的账本回收记录` }
+          : staleFocusClosed > 0
+          ? { toast: `已清理 ${staleFocusClosed} 条过期未结束的专注` }
+          : rolled > 0
+            ? { toast: `已将 ${rolled} 项逾期任务加入今日计划，截止日期未改` }
+            : {}),
+      });
+    } catch (e) {
+      const detail = errorMessage(e, "初始化失败");
+      const diskHint =
+        /space|磁盘|disk|full|os error 112|SQLITE_FULL|SQLITE_IOERR/i.test(
+          detail,
+        )
+          ? "（系统盘空间不足，请清理 C 盘后重启）"
+          : "";
+      set({
+        ready: true,
+        error: `${detail}${diskHint}`,
+      });
+    }
+  },
+
+  maybeRollover: async () => {
+    try {
+      const today = todayDateString();
+      const rolled = await db.rolloverOverdueTasks();
+      const onTodayNav = get().nav === "today";
+      const cursorStale = get().calendarCursor !== today;
+      if (rolled > 0 || (onTodayNav && cursorStale)) {
+        if (rolled > 0) await get().refreshAll();
+        set({
+          ...(onTodayNav || rolled > 0 ? { calendarCursor: today } : {}),
+          ...(rolled > 0
+            ? { toast: `已将 ${rolled} 项逾期任务加入今日计划，截止日期未改` }
+            : {}),
+        });
+      }
+    } catch {
+      /* ignore rollover errors */
+    }
+  },
+
+  refreshAll: async () => {
+    const [
+      tasks,
+      trashTasks,
+      tags,
+      tagMap,
+      smartLists,
+      habits,
+      habitChecks,
+      timers,
+      settings,
+      projects,
+      taskTemplates,
+    ] = await Promise.all([
+      db.fetchTasks(),
+      db.fetchTrashTasks(),
+      db.fetchTags(),
+      db.fetchTaskTagMap(),
+      db.fetchSmartLists(),
+      db.fetchHabits(),
+      db.fetchHabitChecks(),
+      db.fetchTimers(),
+      db.loadAppSettings(),
+      db.fetchProjects(),
+      db.fetchTaskTemplates(),
+    ]);
+    set((s) => ({
+      tasks,
+      trashTasks,
+      tags,
+      tagMap,
+      smartLists,
+      habits,
+      habitChecks,
+      timers,
+      // Don't regress onboarding if a concurrent refresh raced ahead of persist.
+      settings: {
+        ...settings,
+        onboardingComplete:
+          s.settings.onboardingComplete || settings.onboardingComplete,
+      },
+      projects,
+      taskTemplates,
+    }));
+  },
+
+  setNavigationGuard: (navigationGuard) => set({ navigationGuard }),
+  setNav: (nav) => {
+    if (nav === "myday") nav = "today";
+    const legacyCompleted = nav === "completed";
+    if (legacyCompleted) nav = "all";
+    if (nav === get().nav) {
+      if (legacyCompleted) set({ allTasksFilter: "completed" });
+      return;
+    }
+    const guard = get().navigationGuard;
+    if (guard && !guard()) return;
+    set({
+      nav,
+      ...(legacyCompleted ? { allTasksFilter: "completed" as const } : {}),
+      selectedTaskId: null,
+      dateScope:
+        nav === "today" || nav === "inbox" || nav === "all"
+          ? "day"
+          : nav === "calendar"
+            ? "month"
+            : get().dateScope,
+      calendarCursor:
+        nav === "today" || nav === "week"
+          ? todayDateString()
+          : get().calendarCursor,
+      viewMode:
+        nav === "board"
+          ? "board"
+          : nav === "calendar"
+            ? "calendar"
+            : get().viewMode,
+    });
+  },
+  setAllTasksFilter: (allTasksFilter) => set({ allTasksFilter }),
+  setViewMode: (viewMode) => set({ viewMode }),
+  setDateScope: (dateScope) => set({ dateScope }),
+  setCalendarCursor: (calendarCursor) => set({ calendarCursor }),
+  selectTask: (selectedTaskId, opts) =>
+    set({
+      selectedTaskId,
+      detailPreferEdit: Boolean(opts?.edit),
+    }),
+  openCreateTask: () => set({ createTaskOpen: true, selectedTaskId: null }),
+  closeCreateTask: () => set({ createTaskOpen: false }),
+  setActiveTag: (activeTagId) => {
+    const current = get().filter.tagIds;
+    const tagIds = !activeTagId
+      ? []
+      : current.includes(activeTagId)
+        ? current.filter((id) => id !== activeTagId)
+        : [...current, activeTagId];
+    const taskViews: NavId[] = [
+      "today",
+      "myday",
+      "inbox",
+      "completed",
+      "all",
+      "board",
+      "calendar",
+      "week",
+      "tags",
+    ];
+    const nextNav = taskViews.includes(get().nav) ? get().nav : "all";
+    const guard = get().navigationGuard;
+    if (nextNav !== get().nav && guard && !guard()) return;
+    set({
+      activeTagId: tagIds[tagIds.length - 1] ?? null,
+      filter: { ...get().filter, tagIds },
+      nav: nextNav,
+    });
+  },
+  setFilter: (patch) => set({ filter: { ...get().filter, ...patch } }),
+  setToast: (toast) =>
+    set({
+      toast,
+      ...(toast === null ? { canUndo: false, _undoAction: null } : {}),
+    }),
+  undo: async () => {
+    const action = get()._undoAction;
+    if (!action) return;
+    set({ canUndo: false, _undoAction: null, toast: null });
+    await action();
+    set({ toast: "已撤销" });
+  },
+
+  addTask: async (draft) => {
+    try {
+      const task = await db.createTask(draft);
+      const [tasks, tagMap] = await Promise.all([
+        db.fetchTasks(),
+        db.fetchTaskTagMap(),
+      ]);
+      set({ tasks, tagMap, toast: "已创建任务" });
+      void emitDataChanged("task");
+      return task;
+    } catch (e) {
+      set({ error: errorMessage(e, "创建失败") });
+      return null;
+    }
+  },
+
+  saveTask: async (id, updates) => {
+    try {
+      const updated = await db.updateTask(id, updates);
+      if (updated) {
+        set((state) => ({
+          tasks: state.tasks.map((task) =>
+            task.id === id ? updated : task,
+          ),
+        }));
+        void emitDataChanged("task");
+        if (updates.status === "completed") await get().refreshAll();
+      }
+    } catch (e) {
+      const msg = errorMessage(e, "保存失败");
+      set({ error: msg, toast: msg });
+      throw e;
+    }
+  },
+
+  toggleComplete: async (id) => {
+    if (pendingCompleteIds.has(id)) return;
+    const before = get().tasks.find((task) => task.id === id);
+    if (!before) return;
+    const nextStatus = before.status === "completed" ? "pending" : "completed";
+    pendingCompleteIds.add(id);
+    set((state) => ({
+      tasks: state.tasks.map((task) =>
+        task.id === id
+          ? {
+              ...task,
+              status: nextStatus,
+              completed_at: nextStatus === "completed" ? nowIso() : null,
+            }
+          : task,
+      ),
+    }));
+    try {
+      const { task, spawned } = await db.toggleTaskComplete(id);
+      if (task?.status === "completed" && task.id) {
+        // Finish notification cleanup before refreshing reminder state. A
+        // fire-and-forget cleanup could race with the reminder scan and make a
+        // just-completed task pop up again.
+        await db.setTaskNotificationsStatus(task.id, "dismissed").catch(() => undefined);
+        await emit("notification:task-dismissed", task.id).catch(() => undefined);
+        window.dispatchEvent(new Event("notifications:changed"));
+      }
+      set({
+        toast: task?.status === "completed" ? "任务已完成" : "已恢复为待办",
+        canUndo: true,
+        _undoAction: async () => {
+          await db.toggleTaskComplete(id);
+          await get().refreshAll();
+        },
+      });
+      if (spawned) await get().refreshAll();
+      try {
+        await emitDataChanged("task");
+      } catch (e) {
+        set({ toast: errorMessage(e, "已保存，但刷新列表失败") });
+      }
+    } catch (e) {
+      const msg = errorMessage(e, "完成任务失败");
+      set((state) => ({
+        tasks: state.tasks.map((task) => (task.id === id ? before : task)),
+        error: msg,
+        toast: msg,
+      }));
+    } finally {
+      pendingCompleteIds.delete(id);
+    }
+  },
+
+  deleteTask: async (id) => {
+    await db.softDeleteTask(id);
+    set({
+      selectedTaskId: null,
+      toast: "任务已移入回收站",
+      canUndo: true,
+      _undoAction: async () => {
+        await db.restoreTask(id);
+        await get().refreshAll();
+      },
+    });
+    const [tasks, trashTasks] = await Promise.all([
+      db.fetchTasks(),
+      db.fetchTrashTasks(),
+    ]);
+    set({ tasks, trashTasks });
+    void emitDataChanged("task");
+  },
+
+  batchComplete: async (ids) => {
+    const toComplete = get()
+      .tasks.filter((task) => ids.includes(task.id) && task.status !== "completed")
+      .map((task) => task.id);
+    if (!toComplete.length) return;
+    try {
+      await db.batchSetTaskStatus(toComplete, "completed");
+      await Promise.all(
+        toComplete.map((taskId) => db.setTaskNotificationsStatus(taskId, "dismissed")),
+      )
+        .catch(() => undefined);
+      await Promise.all(
+        toComplete.map((taskId) => emit("notification:task-dismissed", taskId)),
+      ).catch(() => undefined);
+      window.dispatchEvent(new Event("notifications:changed"));
+      await get().refreshAll();
+      set({
+        toast: `已完成 ${toComplete.length} 项任务`,
+        canUndo: true,
+        _undoAction: async () => {
+          await db.batchSetTaskStatus(toComplete, "pending");
+          await get().refreshAll();
+        },
+      });
+    } catch (e) {
+      const msg = errorMessage(e, "批量完成失败");
+      set({ error: msg, toast: msg });
+    }
+  },
+
+  batchDelete: async (ids) => {
+    await db.batchSoftDeleteTasks(ids);
+    await get().refreshAll();
+    set({
+      selectedTaskId: null,
+      toast: `已删除 ${ids.length} 项任务`,
+      canUndo: true,
+      _undoAction: async () => {
+        await db.batchRestoreTasks(ids);
+        await get().refreshAll();
+      },
+    });
+  },
+
+  restoreTask: async (id) => {
+    await db.restoreTask(id);
+    await get().refreshAll();
+  },
+
+  purgeTrash: async () => {
+    await db.purgeTrash();
+    await get().refreshAll();
+  },
+
+  reorder: async (ids) => {
+    await db.reorderTasks(ids);
+    await get().refreshAll();
+  },
+
+  addTag: async (name) => {
+    await db.createTag(name);
+    await get().refreshAll();
+  },
+
+  removeTag: async (id) => {
+    await db.deleteTag(id);
+    await get().refreshAll();
+  },
+
+  setTaskTags: async (taskId, tagIds) => {
+    await db.setTaskTags(taskId, tagIds);
+    await get().refreshAll();
+  },
+
+  addProject: async (name) => {
+    await db.createProject(name);
+    await get().refreshAll();
+    set({ toast: "项目已创建" });
+  },
+
+  archiveProject: async (id) => {
+    await db.archiveProject(id);
+    await get().refreshAll();
+    set({ toast: "项目已归档" });
+  },
+
+  saveTemplate: async (name, draft) => {
+    await db.saveTaskTemplate(name, draft);
+    await get().refreshAll();
+    set({ toast: "任务模板已保存" });
+  },
+
+  useTemplate: async (id) => {
+    const template = get().taskTemplates.find((item) => item.id === id);
+    if (!template) return;
+    const draft = JSON.parse(template.task_json) as TaskDraft;
+    const variables = [
+      ...new Set(JSON.stringify(draft).match(/\{\{([^}]+)\}\}/g) ?? []),
+    ];
+    let serialized = JSON.stringify(draft);
+    for (const token of variables) {
+      const value = window.prompt(`模板参数：${token.slice(2, -2)}`, "") ?? "";
+      serialized = serialized.split(token).join(value);
+    }
+    const resolved = JSON.parse(serialized) as TaskDraft;
+    const root = await get().addTask({
+      ...resolved,
+      title: resolved.title || template.name,
+      due_date:
+        resolved.relative_due_days != null
+          ? addDays(todayDateString(), resolved.relative_due_days)
+          : todayDateString(),
+    });
+    if (root) {
+      for (const subtask of resolved.subtasks ?? []) {
+        await get().addTask({
+          ...subtask,
+          parent_id: root.id,
+          due_date: null,
+        });
+      }
+    }
+    set({ toast: `已从「${template.name}」创建任务` });
+  },
+
+  removeTemplate: async (id) => {
+    await db.deleteTaskTemplate(id);
+    await get().refreshAll();
+  },
+
+  saveSmartList: async (name) => {
+    await db.createSmartList(name, get().filter);
+    await get().refreshAll();
+    set({ toast: "已保存智能列表" });
+  },
+
+  removeSmartList: async (id) => {
+    await db.deleteSmartList(id);
+    await get().refreshAll();
+  },
+
+  applySmartList: (id) => {
+    const list = get().smartLists.find((s) => s.id === id);
+    if (!list) return;
+    const guard = get().navigationGuard;
+    if (get().nav !== "all" && guard && !guard()) return;
+    try {
+      const filter = JSON.parse(list.filter_json) as FilterState;
+      set({ filter, activeSmartListId: id, nav: "all" });
+    } catch {
+      /* ignore */
+    }
+  },
+
+  addAttachment: async (taskId, data) => {
+    await db.addAttachment(taskId, data);
+    await get().loadAttachments(taskId);
+  },
+
+  removeAttachment: async (id) => {
+    const taskId = get().selectedTaskId;
+    await db.removeAttachment(id);
+    if (taskId) await get().loadAttachments(taskId);
+  },
+
+  loadAttachments: async (taskId) => {
+    const attachments = await db.fetchAttachments(taskId);
+    set({ attachments });
+  },
+
+  addHabit: async (title, target = 3) => {
+    await db.createHabit(title, target);
+    await get().refreshAll();
+  },
+
+  removeHabit: async (id) => {
+    await db.deleteHabit(id);
+    await get().refreshAll();
+  },
+
+  toggleHabitDay: async (habitId, date) => {
+    await db.toggleHabitCheck(habitId, date);
+    await get().refreshAll();
+  },
+
+  addTimer: async (draft) => {
+    try {
+      const timer = await db.createTimer(draft);
+      await get().refreshTimers();
+      if (draft.start) {
+        try {
+          await invoke("start_timer_ui");
+        } catch {
+          /* ignore if not in tauri */
+        }
+        set({ toast: `「${timer.title}」已开始，主窗口已最小化` });
+      } else {
+        set({ toast: "已创建提醒" });
+      }
+      return timer;
+    } catch (e) {
+      set({ toast: e instanceof Error ? e.message : "创建提醒失败" });
+      return null;
+    }
+  },
+
+  startTimer: async (id) => {
+    await db.startTimer(id);
+    await get().refreshTimers();
+    try {
+      await invoke("start_timer_ui");
+    } catch {
+      /* ignore */
+    }
+    const t = get().timers.find((x) => x.id === id);
+    set({ toast: t ? `「${t.title}」已开始，主窗口已最小化` : "提醒已开始" });
+  },
+
+  pauseTimer: async (id) => {
+    await db.pauseTimer(id);
+    await get().refreshTimers();
+  },
+
+  resetTimer: async (id) => {
+    await db.resetTimer(id);
+    await get().refreshTimers();
+  },
+
+  extendTimer: async (id, additionalSec) => {
+    await db.extendTimer(id, additionalSec);
+    await get().refreshTimers();
+    set({ toast: `已增加 ${Math.round(additionalSec / 60)} 分钟` });
+  },
+
+  removeTimer: async (id) => {
+    await db.deleteTimer(id);
+    await get().refreshTimers();
+  },
+
+  refreshTimers: async () => {
+    const timers = await db.fetchTimers();
+    set({ timers });
+  },
+
+  settleTimers: async () => {
+    const fired = await db.settleExpiredTimers();
+    if (fired.length) {
+      await get().refreshTimers();
+      void emitDataChanged("timer");
+    }
+    return fired;
+  },
+
+  setTheme: async (theme) => {
+    await db.setThemeSetting(theme);
+    applyTheme(theme);
+    set((s) => ({ settings: { ...s.settings, theme } }));
+  },
+
+  updateSettings: async (patch) => {
+    // Apply optimistically so UI (e.g. onboarding dismiss) never waits on SQLite.
+    const previous = get().settings;
+    set((s) => ({ settings: { ...s.settings, ...patch } }));
+    try {
+      if (patch.notifyAhead !== undefined) {
+        await db.setSetting("notify_ahead", String(patch.notifyAhead));
+      }
+      if (patch.autostart !== undefined) {
+        await db.setSetting("autostart", String(patch.autostart));
+      }
+      if (patch.privacyMode !== undefined) {
+        await db.setSetting("privacy_mode", String(patch.privacyMode));
+      }
+      if (patch.autoBackup !== undefined) {
+        await db.setSetting("auto_backup", String(patch.autoBackup));
+      }
+      if (patch.desktopWidgetMode !== undefined) {
+        await db.setSetting("desktop_widget_mode", patch.desktopWidgetMode);
+      }
+      if (patch.desktopWidgetLayer !== undefined) {
+        await db.setSetting("desktop_widget_layer", patch.desktopWidgetLayer);
+        const { applyVisibleDesktopWidgetLayer } = await import("@/lib/desktopWidgets");
+        await applyVisibleDesktopWidgetLayer(patch.desktopWidgetLayer);
+      }
+      if (patch.onboardingComplete !== undefined) {
+        await db.setSetting(
+          "onboarding_complete",
+          String(patch.onboardingComplete),
+        );
+      }
+      await emitDataChanged("settings");
+    } catch (e) {
+      set((state) => {
+        const settings = { ...state.settings };
+        for (const key of Object.keys(patch) as (keyof AppSettings)[]) {
+          if (Object.is(settings[key], patch[key])) {
+            (settings as Record<keyof AppSettings, AppSettings[keyof AppSettings]>)[key] = previous[key];
+          }
+        }
+        return {
+          settings,
+          toast: `设置保存失败，已恢复原设置：${errorMessage(e, "未知错误")}`,
+        };
+      });
+    }
+  },
+
+  saveAi: async (ai) => {
+    await db.saveAiSettings(ai);
+    set((s) => ({ settings: { ...s.settings, ai }, toast: "AI 设置已保存" }));
+  },
+
+  setFocusTask: (focusTaskId) => {
+    // Re-binding the same task must not wipe an in-progress session
+    // (detail drawer / pomodoro panel sync often re-calls this).
+    if (get().focusTaskId === focusTaskId) {
+      set({ focusTaskId });
+      return;
+    }
+    if (get().focusRunning) {
+      set({ toast: "已有专注任务正在进行，请先暂停后再切换" });
+      return;
+    }
+    set({
+      focusTaskId,
+      focusSeconds: 25 * 60,
+      focusEndsAt: null,
+      focusRunning: false,
+      focusSessionId: null,
+    });
+  },
+  tickFocus: () => {
+    const { focusRunning, focusEndsAt, focusSessionId } = get();
+    if (!focusRunning || focusEndsAt === null) return;
+    const next = remainingFocusSeconds(focusEndsAt);
+    set({ focusSeconds: next });
+    if (Date.now() - lastFocusHeartbeatWrite >= FOCUS_HEARTBEAT_MS) {
+      lastFocusHeartbeatWrite = Date.now();
+      get().persistFocusHeartbeat();
+    }
+    if (next === 0 && focusSessionId) {
+      void db.finishFocusSession(focusSessionId).then(async () => {
+        await db.saveActiveFocus(null);
+        await get().refreshAll();
+      });
+      set({
+        focusRunning: false,
+        focusEndsAt: null,
+        focusSessionId: null,
+        toast: "专注完成，已记录实际耗时",
+      });
+    }
+  },
+  persistFocusHeartbeat: (hidden = false) => {
+    const { focusRunning, focusSessionId, focusTaskId, focusEndsAt, focusSeconds } =
+      get();
+    if (!focusRunning || !focusSessionId || focusEndsAt == null) return;
+    lastFocusHeartbeatWrite = Date.now();
+    void db.saveActiveFocus({
+      sessionId: focusSessionId,
+      taskId: focusTaskId,
+      endsAt: focusEndsAt,
+      plannedSec: Math.max(focusSeconds, 1),
+      lastHeartbeatAt: Date.now(),
+      hiddenAt: hidden ? Date.now() : null,
+    });
+  },
+  toggleFocus: async () => {
+    const { focusRunning, focusSessionId, focusTaskId, focusSeconds, focusEndsAt } =
+      get();
+    if (focusRunning) {
+      const remaining = remainingFocusSeconds(focusEndsAt);
+      if (focusSessionId) {
+        await db.finishFocusSession(focusSessionId, "手动暂停");
+      }
+      await db.saveActiveFocus(null);
+      set({
+        focusRunning: false,
+        focusEndsAt: null,
+        focusSeconds: remaining > 0 ? remaining : focusSeconds,
+        focusSessionId: null,
+        toast: "本次专注时间已记录",
+      });
+      await get().refreshAll();
+      return;
+    }
+    const session = await db.startFocusSession(focusTaskId);
+    const plannedSec = focusSeconds;
+    const endsAt = focusEndsAtFromRemaining(plannedSec);
+    await db.saveActiveFocus({
+      sessionId: session.id,
+      taskId: focusTaskId,
+      endsAt,
+      plannedSec,
+      lastHeartbeatAt: Date.now(),
+      hiddenAt: null,
+    });
+    set({
+      focusRunning: true,
+      focusSessionId: session.id,
+      focusEndsAt: endsAt,
+      focusSeconds: remainingFocusSeconds(endsAt),
+    });
+  },
+  resetFocus: async () => {
+    const { focusSessionId } = get();
+    if (focusSessionId) {
+      await db.finishFocusSession(focusSessionId, "重置计时器");
+      await get().refreshAll();
+    }
+    await db.saveActiveFocus(null);
+    set({
+      focusSeconds: 25 * 60,
+      focusEndsAt: null,
+      focusRunning: false,
+      focusSessionId: null,
+    });
+  },
+  resolveFocusRecovery: async (action) => {
+    const pending = get().pendingFocusRecovery;
+    if (!pending) return;
+    const extraEndedAt = (startedAt: string) => {
+      const started = Date.parse(startedAt);
+      const fallback = toSafeIso(started, startedAt);
+      if (action === "abandon" || action === "settle_activity") return fallback;
+      const sessionStart = new Date(pending.session.started_at).getTime();
+      const plannedMs =
+        Number.isFinite(sessionStart) && Number.isFinite(pending.plannedSettleAt)
+          ? Math.max(0, pending.plannedSettleAt - sessionStart)
+          : 25 * 60 * 1000;
+      const startMs = Number.isFinite(started) ? started : Date.now();
+      const plannedEnd = startMs + plannedMs;
+      if (action === "continue") {
+        return toSafeIso(Math.min(Date.now(), plannedEnd), fallback);
+      }
+      return toSafeIso(plannedEnd, fallback);
+    };
+    const finishExtras = async () => {
+      const reason =
+        action === "abandon" ? "异常退出，已放弃" : "异常退出后结算";
+      for (const extra of pending.extras) {
+        try {
+          await db.finishFocusSession(
+            extra.id,
+            reason,
+            extraEndedAt(extra.started_at),
+          );
+        } catch {
+          try {
+            await db.finishFocusSession(extra.id, reason, extra.started_at);
+          } catch {
+            /* leftover sessions are force-closed below */
+          }
+        }
+      }
+    };
+    const forceCloseOpen = async (reason: string) => {
+      try {
+        const leftover = await db.fetchOpenFocusSessions();
+        for (const session of leftover) {
+          try {
+            await db.finishFocusSession(
+              session.id,
+              reason,
+              toSafeIso(Date.parse(session.started_at), session.started_at),
+            );
+          } catch {
+            /* ignore */
+          }
+        }
+        await db.saveActiveFocus(null);
+      } catch {
+        /* ignore */
+      }
+    };
+    try {
+      if (action === "continue" && pending.canContinue && pending.endsAt) {
+        await finishExtras();
+        await db.saveActiveFocus({
+          sessionId: pending.session.id,
+          taskId: pending.session.task_id,
+          endsAt: pending.endsAt,
+          plannedSec: Math.max(pending.remainingSec, 1),
+          lastHeartbeatAt: Date.now(),
+          hiddenAt: null,
+        });
+        set({
+          pendingFocusRecovery: null,
+          focusTaskId: pending.session.task_id,
+          focusSessionId: pending.session.id,
+          focusEndsAt: pending.endsAt,
+          focusSeconds: pending.remainingSec,
+          focusRunning: true,
+          toast: pending.extraCount
+            ? `已继续上次专注，另外 ${pending.extraCount} 条已按计划时长结算`
+            : "已继续上次专注",
+        });
+        return;
+      }
+      const abandon = action === "abandon";
+      const endedAt = abandon
+        ? toSafeIso(
+            Date.parse(pending.session.started_at),
+            pending.session.started_at,
+          )
+        : toSafeIso(
+            action === "settle_planned"
+              ? pending.plannedSettleAt
+              : pending.activitySettleAt,
+            pending.session.started_at,
+          );
+      await db.finishFocusSession(
+        pending.session.id,
+        abandon ? "异常退出，已放弃" : "异常退出后结算",
+        endedAt,
+      );
+      await finishExtras();
+      await db.saveActiveFocus(null);
+      set({
+        pendingFocusRecovery: null,
+        focusSessionId: null,
+        focusEndsAt: null,
+        focusRunning: false,
+        toast: abandon
+          ? "已放弃上次未结束的专注"
+          : action === "settle_planned"
+            ? "已按计划时长结算专注"
+            : "已按最后活动时间结算专注",
+      });
+      await get().refreshAll();
+    } catch {
+      await forceCloseOpen("异常退出，已放弃");
+      set({
+        pendingFocusRecovery: null,
+        focusSessionId: null,
+        focusEndsAt: null,
+        focusRunning: false,
+        toast: "专注恢复未能完成，已关闭卡住的会话",
+      });
+      try {
+        await get().refreshAll();
+      } catch {
+        /* ignore */
+      }
+    }
+  },
+  openMorningPlan: async () => {
+    if (get().pendingMorningPlan) return;
+    set({
+      pendingMorningPlan: buildTodayPlanPicker(get().tasks, todayDateString()),
+    });
+  },
+  resolveMorningPlan: async (payload) => {
+    const today = todayDateString();
+    try {
+      const taskIds = payload?.taskIds ?? [];
+      const titles = (payload?.titles ?? [])
+        .map((title) => title.trim())
+        .filter(Boolean);
+      if (taskIds.length || titles.length) {
+        for (const id of taskIds) {
+          await db.updateTask(id, { my_day_date: today });
+        }
+        for (const title of titles) {
+          await db.createTask({
+            title,
+            due_date: null,
+            my_day_date: today,
+          });
+        }
+        await get().refreshAll();
+        const count = taskIds.length + titles.length;
+        set({
+          pendingMorningPlan: null,
+          nav: "today",
+          calendarCursor: today,
+          toast: `已将 ${count} 项加入今日计划`,
+        });
+      } else {
+        set({ pendingMorningPlan: null });
+      }
+      await db.setSetting("last_morning_plan_date", today);
+    } catch (e) {
+      set({
+        toast: errorMessage(e, "加入今日计划失败"),
+        error: errorMessage(e, "加入今日计划失败"),
+      });
+    }
+  },
+  setReminderSync: (reminderSync) => set({ reminderSync }),
+}));
