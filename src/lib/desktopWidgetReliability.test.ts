@@ -1,0 +1,87 @@
+import { readFileSync } from "node:fs";
+import { describe, expect, it } from "vitest";
+
+const rust = readFileSync("src-tauri/src/lib.rs", "utf8");
+const mainApp = readFileSync("src/app/MainApp.tsx", "utf8");
+const entrypoint = readFileSync("src/main.tsx", "utf8");
+
+describe("desktop widget reliability contract", () => {
+  it("keeps the main window hidden until the first usable frame is ready", () => {
+    expect(rust).not.toContain("let _ = main.show();");
+    expect(mainApp).toContain("if (!ready) return;");
+    expect(mainApp).toContain("window.requestAnimationFrame");
+    expect(mainApp).toMatch(
+      /const appWindow = getCurrentWindow\(\);[\s\S]*?\.show\(\)/,
+    );
+    expect(entrypoint).toMatch(
+      /function BootError[\s\S]*?getCurrentWebviewWindow\(\)[\s\S]*?\.show\(\)/,
+    );
+  });
+
+  it("does not demote visible widgets when the main window closes", () => {
+    expect(rust).not.toContain("refresh_visible_desktop_widgets");
+  });
+
+  it("opens a replacement mode before hiding the current mode", () => {
+    const classic = rust.slice(
+      rust.indexOf("fn show_desktop_widgets"),
+      rust.indexOf("fn show_dashboard_strip"),
+    );
+    expect(classic.indexOf("pin_desktop_widget")).toBeLessThan(
+      classic.indexOf('hide_labeled_windows(&app, &["widget-dashboard"])'),
+    );
+
+    const dashboard = rust.slice(
+      rust.indexOf("fn show_dashboard_strip"),
+      rust.indexOf("fn toggle_desktop_widgets"),
+    );
+    expect(dashboard.indexOf("pin_desktop_widget")).toBeLessThan(
+      dashboard.indexOf('hide_labeled_windows(&app, &["widget-calendar"'),
+    );
+  });
+
+  it("validates widget navigation and targets only the main window", () => {
+    expect(rust).toContain("widget_nav_allowed(value)");
+    expect(rust).toContain('"ledger" | "ledger-budget"');
+    expect(rust).toContain('emit_to("main", "widget:navigate"');
+  });
+
+  it("pins the shortcut dock with the same desktop widget layering", () => {
+    const present = rust.slice(
+      rust.indexOf("fn present_shortcut_dock"),
+      rust.indexOf("fn show_shortcut_dock"),
+    );
+    expect(present).toContain("pin_desktop_widget");
+    expect(rust).toContain("detach_window_owner");
+  });
+
+  it("keeps the saved layer when widgets are opened from the tray", () => {
+    expect(rust).toContain('emit("tray:desktop-widgets", "dashboard")');
+    expect(rust).toContain('emit("tray:desktop-widgets", "classic")');
+    expect(rust).not.toContain('show_dashboard_strip(app.clone(), Some("bottom".into()))');
+    expect(rust).not.toContain('show_desktop_widgets(app.clone(), Some("bottom".into()))');
+    expect(mainApp).toContain("current.desktopWidgetLayer");
+  });
+
+  it("applies a new layer only to already-visible widgets", () => {
+    expect(rust).toContain("fn apply_desktop_widget_layer");
+    expect(rust).toContain("already_visible");
+  });
+
+  it("clips rounded widgets and hides native caption chrome", () => {
+    expect(rust).toContain("fn clip_widget_rounded");
+    expect(rust).toContain("fn hide_widget_system_chrome");
+    expect(rust).toContain("refresh_widget_chrome");
+    expect(rust).toContain("DWMWA_CAPTION_COLOR");
+  });
+
+  it("does not flash HWND_TOPMOST when sending widgets to the bottom layer", () => {
+    const fn = rust.slice(
+      rust.indexOf("fn stabilize_widget_layer"),
+      rust.indexOf("fn detach_window_owner"),
+    );
+    const afterTopReturn = fn.slice(fn.indexOf("return Ok(());"));
+    expect(afterTopReturn).toContain("HWND_NOTOPMOST");
+    expect(afterTopReturn).not.toContain("HWND_TOPMOST");
+  });
+});
