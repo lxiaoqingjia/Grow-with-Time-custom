@@ -446,7 +446,7 @@ CREATE TABLE IF NOT EXISTS habit_checks (
 
 INSERT OR IGNORE INTO settings (key, value) VALUES ('notify_ahead', '30');
 INSERT OR IGNORE INTO settings (key, value) VALUES ('autostart', 'false');
-INSERT OR IGNORE INTO settings (key, value) VALUES ('privacy_mode', 'false');
+INSERT OR IGNORE INTO settings (key, value) VALUES ('privacy_mode', 'true');
 INSERT OR IGNORE INTO settings (key, value) VALUES ('ai_base_url', 'https://api.openai.com/v1');
 INSERT OR IGNORE INTO settings (key, value) VALUES ('ai_api_key', '');
 INSERT OR IGNORE INTO settings (key, value) VALUES ('ai_model', 'gpt-4o-mini');
